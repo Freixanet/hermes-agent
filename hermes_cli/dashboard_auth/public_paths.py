@@ -27,7 +27,7 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     "/api/cron/fire",
     # Alice iOS QR-pairing claim. NOT cookie-gated (a phone mid-pairing has no
     # session): it carries a one-time, 5-minute token minted by an
-    # authenticated /api/alice/pairing/session call, single-use and popped
-    # before verification, plus a tailnet-only source gate — the token, not
+    # authenticated /api/alice/pairing/session call, kept only in process
+    # memory and consumed once, plus a tailnet-only source gate — the token, not
     # this allowlist, is the security boundary.
     "/api/alice/pairing/claim"})

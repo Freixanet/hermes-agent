@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import * as QRCode from "qrcode";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -14,9 +14,9 @@ import { api, type AlicePairingSession } from "@/lib/api";
 import { cn, themedBody } from "@/lib/utils";
 
 /**
- * "Connect Alice": mints one Alice QR-pairing offer and shows it as a QR
- * code for the iPhone Camera. The phone claims the token once — after that
- * (or after the TTL) the code is dead and a fresh one costs one click.
+ * "Connect Alice": mint one short-lived, one-time Alice v1 pairing offer and
+ * render it as a QR. The QR contains only the temporary claim bearer; Hermes'
+ * long-lived gateway/dashboard credentials are returned only after the claim.
  */
 export function PairDeviceDialog({
   onClose,
@@ -31,34 +31,40 @@ export function PairDeviceDialog({
   const [minting, setMinting] = useState(false);
   const [copied, setCopied] = useState(false);
   const [, setTick] = useState(0);
-  const sessionRef = useRef(session);
-  sessionRef.current = session;
+  const mintGeneration = useRef(0);
 
   const mint = useCallback(async () => {
+    const generation = ++mintGeneration.current;
     setMinting(true);
     setError(null);
     setCopied(false);
     try {
       const next = await api.startAlicePairing();
+      const dataUrl = await QRCode.toDataURL(next.payload, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        width: 320,
+      });
+      if (generation !== mintGeneration.current) return;
       setSession(next);
-      setQrDataUrl(
-        await QRCode.toDataURL(next.payload, {
-          errorCorrectionLevel: "M",
-          margin: 2,
-          width: 320,
-        }),
-      );
+      setQrDataUrl(dataUrl);
     } catch (e) {
+      if (generation !== mintGeneration.current) return;
       setSession(null);
       setQrDataUrl(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setMinting(false);
+      if (generation === mintGeneration.current) setMinting(false);
     }
   }, []);
 
   useEffect(() => {
-    if (open) void mint();
+    if (open) {
+      void mint();
+    } else {
+      // Ignore an in-flight response from a dialog that has already closed.
+      mintGeneration.current += 1;
+    }
   }, [open, mint]);
 
   useEffect(() => {
@@ -78,25 +84,27 @@ export function PairDeviceDialog({
     };
   }, [open, onClose]);
 
-  // 1 Hz re-render drives the expiry countdown badge.
+  // Drive the expiry text once per second. The value is intentionally not
+  // memoized: each tick must recompute against Date.now().
   useEffect(() => {
     if (!open || !session) return;
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    const id = setInterval(() => setTick((tick) => tick + 1), 1000);
     return () => clearInterval(id);
   }, [open, session]);
 
-  const expiresIn = useMemo(() => {
+  if (!open) return null;
+
+  const expiresIn = (() => {
     if (!session) return "";
     const ms = Date.parse(session.expires_at) - Date.now();
     if (!Number.isFinite(ms) || ms <= 0) return "expired";
     const seconds = Math.ceil(ms / 1000);
     return `${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, "0")}`;
-  }, [session]);
-
-  if (!open) return null;
+  })();
+  const expired = expiresIn === "expired";
 
   const handleCopy = async () => {
-    if (!session) return;
+    if (!session || expired) return;
     if (await copyTextToClipboard(session.payload)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -129,8 +137,8 @@ export function PairDeviceDialog({
             </p>
           </div>
           {session && (
-            <Badge tone={expiresIn === "expired" ? "destructive" : "outline"}>
-              {expiresIn === "expired" ? "expired" : `expires ${expiresIn}`}
+            <Badge tone={expired ? "destructive" : "outline"}>
+              {expired ? "expired" : `expires ${expiresIn}`}
             </Badge>
           )}
         </div>
@@ -155,15 +163,17 @@ export function PairDeviceDialog({
                 className="h-64 w-64 rounded-lg bg-white p-2"
               />
               <ol className="list-decimal space-y-0.5 pl-5 text-xs text-muted-foreground">
-                <li>Install Alice on the iPhone if it is not installed.</li>
-                <li>Point the iPhone Camera app at this code.</li>
-                <li>Open the Alice link and confirm the pairing.</li>
+                <li>Open Alice on the iPhone.</li>
+                <li>Open Connect and tap Scan pairing QR.</li>
+                <li>Scan this code and confirm the pairing.</li>
               </ol>
-              <p className="max-w-full truncate text-center font-mono text-[11px] text-muted-foreground">
-                {session.payload}
-              </p>
               <div className="flex items-center gap-2">
-                <Button size="sm" outlined onClick={() => void handleCopy()}>
+                <Button
+                  size="sm"
+                  outlined
+                  onClick={() => void handleCopy()}
+                  disabled={expired}
+                >
                   <Copy className="h-3.5 w-3.5" />
                   {copied ? "Copied" : "Copy link"}
                 </Button>
@@ -178,8 +188,8 @@ export function PairDeviceDialog({
                 </Button>
               </div>
               <p className="text-center text-[11px] text-muted-foreground">
-                The code works once and stops being served the moment a device
-                claims it. Session ref: {sessionRef.current?.profile}
+                One-time code for profile {session.profile}. Creating a new code
+                invalidates the previous one.
               </p>
             </>
           )}

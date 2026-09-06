@@ -1,35 +1,33 @@
 """QR device-pairing between this dashboard and the Alice iOS app.
 
-The dashboard is the Mac side of the handshake documented in the Alice repo
-(``docs/pairing.md``): it mints a one-time signed ``alice://pair`` deep link,
-the operator shows it as a QR code, and the phone exchanges the token exactly
-once for the connection configuration — gateway URL + key, dashboard URL +
-login. Nothing is persisted: the offer store is in memory, so a dashboard
-restart invalidates every code it ever showed, which is the safe direction to
-fail in. No token, key or credential is ever logged.
+The dashboard is the Mac side of the v1 handshake documented in Alice's
+``docs/pairing.md``: it mints a short-lived ``alice://pair`` deep link, the
+operator shows it as a QR code, and the phone exchanges the bearer token
+exactly once for gateway + optional dashboard credentials.
 
-Two routes:
+Nothing is persisted. Offers live only in this process; restarting the
+dashboard invalidates every outstanding code. The QR contains only the
+short-lived claim token, never Hermes' long-lived credentials.
 
-  POST /api/alice/pairing/session  authenticated (dashboard session token);
-                                   returns the deep link to render as a QR.
-  POST /api/alice/pairing/claim    public (allowlisted in
-                                   ``dashboard_auth.public_paths``); carries
-                                   its own one-time token — that token, not
-                                   the allowlist, is the security boundary,
-                                   exactly like ``/api/cron/fire``.
+Routes:
 
-The claim is additionally gated to the tailnet (``100.64.0.0/10``) plus
-loopback; ``dashboard.alice_pairing.allow_lan`` relaxes that, and
-``dashboard.alice_pairing.address`` overrides the advertised address.
+  POST /api/alice/pairing/session  authenticated; returns one QR payload.
+  POST /api/alice/pairing/claim    public by path, but protected by a one-time
+                                   token plus loopback/tailnet source gating.
+
+V1 deliberately has no HMAC field. Alice cannot verify an HMAC whose key is
+known only to this Mac, so adding one would make the wire format incompatible
+without adding client-verifiable authenticity.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
+import http.client
+import ipaddress
 import json
 import logging
+import re
 import secrets
 import subprocess
 import threading
@@ -40,7 +38,7 @@ from typing import Any, Deque, Dict, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.web_deps import late
@@ -49,12 +47,15 @@ from hermes_cli.web_routers._common import http_failure
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
 
-# Late-bound so a test's monkeypatch on the owning module wins at call time.
+# Late-bound so tests and the dashboard's owning modules remain the authority.
 _require_token = late("_require_token")
 load_config = late("load_config", "hermes_cli.config")
 cfg_get = late("cfg_get", "hermes_cli.config")
 get_env_value_prefer_dotenv = late("get_env_value_prefer_dotenv", "hermes_cli.config")
 get_active_profile = late("get_active_profile", "hermes_cli.profiles")
+normalize_profile_name = late("normalize_profile_name", "hermes_cli.profiles")
+validate_profile_name = late("validate_profile_name", "hermes_cli.profiles")
+profile_exists = late("profile_exists", "hermes_cli.profiles")
 
 OFFER_TTL_SECONDS = 300
 MAX_PENDING_OFFERS = 256
@@ -64,26 +65,21 @@ CLAIM_RATE_MAX_PER_WINDOW = 30
 CLAIM_RATE_WINDOW_SEC = 60.0
 
 _lock = threading.Lock()
-# token -> {"expires_at", "config", "used", "ip", "created_at"}
+# token -> {expires_at, config?, used, ip, profile, created_at}
 _offers: Dict[str, Dict[str, Any]] = {}
 _claim_attempts: Dict[str, Deque[float]] = defaultdict(deque)
 _claim_attempts_lock = threading.Lock()
 
-#: Per-process HMAC secret: only this process verifies what this process
-#: signed, so rotating it with the process is by design (a restart kills any
-#: code shown before it).
-_secret = secrets.token_bytes(32)
 
-
-# --- Protocol: identical bytes to the helper this replaces -----------------
+# --- Protocol: exact Alice v1 envelope -------------------------------------
 
 def _b64url(data: bytes) -> str:
-    """RFC 4648 §5 without padding, matching the iOS parser's strictness."""
+    """RFC 4648 §5 without padding, matching Alice's strict parser."""
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 def _canonical_offer_bytes(offer: Dict[str, Any]) -> bytes:
-    """Fixed key order keeps signatures stable across re-mints."""
+    """Emit the fixed v1 key order used by the Alice helper and docs."""
     payload: Dict[str, Any] = {"c": offer["c"], "t": offer["t"], "e": offer["e"]}
     if offer.get("pr"):
         payload["pr"] = offer["pr"]
@@ -91,35 +87,13 @@ def _canonical_offer_bytes(offer: Dict[str, Any]) -> bytes:
 
 
 def _build_pairing_link(offer: Dict[str, Any]) -> str:
-    signature = hmac.new(_secret, _canonical_offer_bytes(offer), hashlib.sha256).hexdigest()
-    return (
-        f"alice://pair?v=1&p={_b64url(_canonical_offer_bytes(offer))}&s={signature}"
-    )
-
-
-def _self_verify(link: str) -> bool:
-    """Round-trip guard: what we hand to the SPA must parse back and verify."""
-    try:
-        from urllib.parse import parse_qs, urlparse
-
-        parsed = urlparse(link)
-        query = parse_qs(parsed.query)
-        payload = base64.urlsafe_b64decode(query["p"][0] + "=" * (-len(query["p"][0]) % 4))
-        expected = hmac.new(_secret, payload, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, query["s"][0])
-    except Exception:  # noqa: BLE001 — any malformation is a refusal
-        return False
+    return f"alice://pair?v=1&p={_b64url(_canonical_offer_bytes(offer))}"
 
 
 # --- Configuration the offer hands over -----------------------------------
 
 def _read_profile_env(profile: str) -> Dict[str, str]:
-    """Parse the profile's ``.env`` for the gateway's ``API_SERVER_*`` values.
-
-    ``load_env()`` is pinned to the *process* HERMES_HOME, which for the
-    dashboard is the machine root, so the profile file is read directly —
-    the same file the launchd gateway for that profile runs with.
-    """
+    """Read only the selected profile's ``.env`` gateway values."""
     from hermes_constants import get_default_hermes_root
 
     root = Path(get_default_hermes_root())
@@ -146,7 +120,7 @@ def _read_profile_env(profile: str) -> Dict[str, str]:
 
 
 def _tailscale_ipv4() -> Optional[str]:
-    """The address phone and Mac share, the way ``scripts/phone.mjs`` finds it."""
+    """Return this Mac's Tailscale IPv4; never fall back to raw IPv6 in v1."""
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["tailscale", "status", "--json"],
@@ -162,10 +136,11 @@ def _tailscale_ipv4() -> Optional[str]:
         ips = json.loads(proc.stdout).get("Self", {}).get("TailscaleIPs") or []
     except ValueError:
         return None
-    return next((ip for ip in ips if ":" not in ip), ips[0] if ips else None)
+    return next((ip for ip in ips if _is_ipv4(ip)), None)
 
 
 def _pairing_setting(request: Request, key: str, default: Any) -> Any:
+    del request  # global dashboard setting; retained in signature for test seams
     try:
         config = load_config()
     except Exception:  # noqa: BLE001 — config trouble must not kill the route
@@ -173,29 +148,140 @@ def _pairing_setting(request: Request, key: str, default: Any) -> Any:
     return cfg_get(config, "dashboard", "alice_pairing", key, default=default)
 
 
+def _selected_profile(request: Request) -> str:
+    """Use the dashboard's explicit management profile when supplied."""
+    requested = request.query_params.get("profile")
+    if not requested:
+        return get_active_profile() or "default"
+    try:
+        profile = normalize_profile_name(requested)
+        validate_profile_name(profile)
+    except Exception as exc:  # noqa: BLE001 — ingress validation fails closed
+        raise HTTPException(status_code=400, detail="Invalid Hermes profile") from exc
+    if not profile_exists(profile):
+        raise HTTPException(status_code=404, detail="Hermes profile not found")
+    return profile
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _validated_advertised_host(raw: Any) -> Optional[str]:
+    """Accept one IPv4 or DNS hostname suitable for ``http://host:port``."""
+    value = str(raw or "").strip().rstrip(".")
+    if not value or len(value) > 253 or any(ch.isspace() for ch in value):
+        return None
+    if "/" in value or ":" in value or "@" in value:
+        return None
+    if _is_ipv4(value):
+        address = ipaddress.ip_address(value)
+        return None if address.is_loopback or address.is_unspecified else value
+    if value.lower() == "localhost":
+        return None
+    # A dotted-numeric value that is not a real IPv4 is not a hostname fallback.
+    if all(ch.isdigit() or ch == "." for ch in value):
+        return None
+    labels = value.split(".")
+    if any(not label or not _HOST_LABEL.fullmatch(label) for label in labels):
+        return None
+    return value
+
+
 def _source_ip(request: Request) -> str:
-    """The peer address, deliberately NOT ``client_ip()``'s first
-    ``X-Forwarded-For`` hop: a client-supplied XFF header would let a
-    hostile-LAN caller forge a tailnet address and walk past the source
-    gate. This dashboard is reached directly, so the peer is the truth."""
+    """Use the actual peer, never a client-controlled forwarded header."""
     return request.client.host if request.client else ""
 
 
-def _origin_allowed(ip: str, allow_lan: bool) -> bool:
-    if allow_lan:
-        return True
-    address = ip.replace("::ffff:", "")
-    if address in ("::1", "127.0.0.1"):
-        return True
-    parts = address.split(".")
-    if len(parts) < 2:
-        return False
+def _origin_allowed(ip: str) -> bool:
+    """V1 claims are accepted only from loopback or Tailscale IPv4 CGNAT."""
     try:
-        first, second = int(parts[0]), int(parts[1])
+        address = ipaddress.ip_address(ip)
     except ValueError:
-        return False
-    # CGNAT 100.64.0.0/10 — a tailnet peer.
-    return first == 100 and 64 <= second <= 127
+        if ip.lower().startswith("::ffff:"):
+            try:
+                address = ipaddress.ip_address(ip.split(":")[-1])
+            except ValueError:
+                return False
+        else:
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_loopback:
+        return True
+    return isinstance(address, ipaddress.IPv4Address) and address in ipaddress.ip_network(
+        "100.64.0.0/10"
+    )
+
+
+def _dashboard_reachable_on(address: str, bound_host: Any) -> bool:
+    """The claim URL must be reachable directly on the host Alice is given."""
+    bound = str(bound_host or "127.0.0.1").strip().strip("[]").rstrip(".").lower()
+    advertised = address.rstrip(".").lower()
+    return bound in {"0.0.0.0", "::"} or bound == advertised
+
+
+def _valid_port(raw: Any) -> Optional[int]:
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _probe_gateway(address: str, port: int, key: str) -> None:
+    """Probe the exact host/port Alice will use, without following redirects."""
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {key}",
+        "X-Hermes-Session-Token": key,
+    }
+    statuses: list[str] = []
+    last_error: Optional[Exception] = None
+    for route in ("/v1/capabilities", "/v1/models"):
+        conn = http.client.HTTPConnection(address, port, timeout=6)
+        try:
+            conn.request("GET", route, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            response.read(1024)
+            statuses.append(f"{route}: {status}")
+            if 200 <= status < 300:
+                return
+            if status in (401, 403):
+                raise HTTPException(
+                    status_code=503,
+                    detail="The Hermes gateway rejected its configured API key.",
+                )
+        except HTTPException:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            conn.close()
+    detail = ", ".join(statuses)
+    suffix = f" ({detail})" if detail else ""
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"The Hermes gateway is not reachable at the address Alice would use{suffix}. "
+            "Bind the API server to the Tailscale-reachable interface and try again."
+        ),
+    ) from last_error
+
+
+def _has_forwarding_headers(request: Request) -> bool:
+    """V1's source gate is direct-connect only; never trust proxy-supplied peers."""
+    return any(
+        request.headers.get(name)
+        for name in ("forwarded", "x-forwarded-for", "x-real-ip")
+    )
 
 
 def _claim_rate_limited(ip: str) -> bool:
@@ -213,10 +299,8 @@ def _claim_rate_limited(ip: str) -> bool:
 
 def _reset_claim_state_for_tests() -> None:
     """Test-only: drop every offer and rate-limit bucket."""
-    global _secret
     with _lock:
         _offers.clear()
-        _secret = secrets.token_bytes(32)
     with _claim_attempts_lock:
         _claim_attempts.clear()
 
@@ -224,12 +308,8 @@ def _reset_claim_state_for_tests() -> None:
 async def _build_pairing_config(
     request: Request,
 ) -> Tuple[Dict[str, Any], str, str]:
-    """Everything the phone needs, gathered from the sources the dashboard
-    already owns — the profile's gateway env and the dashboard credentials.
-    Raises 503 with an operator-readable reason when the address or key is
-    undiscoverable; raises nothing that leaks either value. Returns the
-    config, the profile name and the advertised address."""
-    profile = get_active_profile() or "default"
+    """Assemble and validate exactly the configuration Alice will receive."""
+    profile = _selected_profile(request)
     env = await asyncio.to_thread(_read_profile_env, profile)
     key = env.get("API_SERVER_KEY")
     if not key:
@@ -241,25 +321,39 @@ async def _build_pairing_config(
                 "profile, then try again."
             ),
         )
-    try:
-        gateway_port = int(env.get("API_SERVER_PORT") or 8642)
-    except ValueError:
-        gateway_port = 8642
+    gateway_port = _valid_port(env.get("API_SERVER_PORT") or 8642)
+    if gateway_port is None:
+        raise HTTPException(status_code=503, detail="The Hermes gateway port is invalid.")
 
-    address = _pairing_setting(request, "address", None) or await asyncio.to_thread(
-        _tailscale_ipv4
-    )
+    configured_address = _pairing_setting(request, "address", None)
+    raw_address = configured_address or await asyncio.to_thread(_tailscale_ipv4)
+    address = _validated_advertised_host(raw_address)
     if not address:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Could not determine the address to advertise. Install "
-                "Tailscale, or set dashboard.alice_pairing.address in "
-                "config.yaml."
+                "Could not determine a safe address to advertise. Install Tailscale, "
+                "or set dashboard.alice_pairing.address to an IPv4/hostname reachable "
+                "through the tailnet."
             ),
         )
 
-    bound_port = getattr(request.app.state, "bound_port", 9119)
+    bound_port = _valid_port(getattr(request.app.state, "bound_port", 9119))
+    if bound_port is None:
+        raise HTTPException(status_code=503, detail="The dashboard port is invalid.")
+    bound_host = getattr(request.app.state, "bound_host", "127.0.0.1")
+    if not _dashboard_reachable_on(address, bound_host):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The dashboard is bound to a local-only address, so this iPhone cannot "
+                "reach the pairing claim endpoint. Bind the dashboard to the Tailscale-"
+                "reachable interface (for example 0.0.0.0 with dashboard auth enabled)."
+            ),
+        )
+
+    await asyncio.to_thread(_probe_gateway, address, gateway_port, key)
+
     config: Dict[str, Any] = {
         "profile": profile,
         "gateway": {"url": f"http://{address}:{gateway_port}", "key": key},
@@ -277,11 +371,13 @@ async def _build_pairing_config(
 
 
 class _ClaimBody(BaseModel):
-    token: str
-    device_name: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=512)
+    device_name: Optional[str] = Field(default=None, max_length=256)
 
 
-_NO_STORE = {"Cache-Control": "no-store"}
+_NO_STORE = {"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"}
 
 
 def _sanitize_device_name(raw: Optional[str]) -> str:
@@ -293,16 +389,37 @@ def _sanitize_device_name(raw: Optional[str]) -> str:
     return cleaned[:64] or "iPhone"
 
 
+def _tombstone(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only replay/expiry metadata after credentials are no longer needed."""
+    return {
+        "expires_at": entry["expires_at"],
+        "used": True,
+        "ip": entry["ip"],
+        "profile": entry["profile"],
+        "created_at": entry["created_at"],
+    }
+
+
 def _gc_offers_locked(now: float) -> None:
-    for token in [t for t, e in _offers.items() if e["expires_at"] <= now]:
+    for token in [t for t, entry in _offers.items() if entry["expires_at"] <= now]:
         del _offers[token]
-    while len(_offers) >= MAX_PENDING_OFFERS:
-        _offers.pop(next(iter(_offers)))
+
+
+async def _read_body_limited(request: Request, limit: int) -> Optional[bytes]:
+    """Read a request body without ever buffering more than ``limit`` bytes."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @router.post("/api/alice/pairing/session")
 async def create_pairing_session(request: Request) -> JSONResponse:
-    """Mint one offer: a signed deep link for the SPA to render as a QR."""
+    """Mint one authenticated, short-lived Alice v1 pairing offer."""
     try:
         _require_token(request)
     except HTTPException:
@@ -311,41 +428,57 @@ async def create_pairing_session(request: Request) -> JSONResponse:
         _log.exception("alice pairing: session token check failed")
         raise HTTPException(status_code=401, detail="Not authenticated") from None
 
-    with http_failure("alice pairing: config assembly failed", 503,
-                      detail="Could not assemble the pairing configuration."):
+    with http_failure(
+        "alice pairing: config assembly failed",
+        503,
+        detail="Could not assemble the pairing configuration.",
+    ):
         config, profile, address = await _build_pairing_config(request)
 
     token = secrets.token_urlsafe(24)
     now = time.time()
-    expires_at = now + OFFER_TTL_SECONDS
-    bound_port = getattr(request.app.state, "bound_port", 9119)
+    # One integer boundary is shared by the QR and the in-memory store.
+    expires_at = int(now) + OFFER_TTL_SECONDS
+    bound_port = _valid_port(getattr(request.app.state, "bound_port", 9119))
+    if bound_port is None:
+        raise HTTPException(status_code=503, detail="The dashboard port is invalid.")
     offer = {
         "c": f"http://{address}:{bound_port}/api/alice/pairing/claim",
         "t": token,
-        "e": int(expires_at),
+        "e": expires_at,
         "pr": profile,
     }
     link = _build_pairing_link(offer)
-    if not _self_verify(link):
-        _log.error("alice pairing: minted link failed self-verification")
-        raise HTTPException(status_code=500, detail="Pairing link failed self-verification")
 
     ip = _source_ip(request)
     with _lock:
         _gc_offers_locked(now)
+
+        # One live QR per dashboard peer + Hermes profile. "New code" really
+        # replaces the previous code instead of silently leaving both valid.
+        for old_token, entry in list(_offers.items()):
+            if not entry["used"] and entry["ip"] == ip and entry["profile"] == profile:
+                del _offers[old_token]
+
         pending_for_ip = sum(
-            1 for e in _offers.values() if e["ip"] == ip and not e["used"]
+            1 for entry in _offers.values() if entry["ip"] == ip and not entry["used"]
         )
         if pending_for_ip >= MAX_PENDING_PER_IP:
             raise HTTPException(
                 status_code=429,
                 detail="Too many pending pairing codes. Use one or let it expire.",
             )
+        if len(_offers) >= MAX_PENDING_OFFERS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many pairing sessions are pending. Let an old code expire.",
+            )
         _offers[token] = {
             "expires_at": expires_at,
             "config": config,
             "used": False,
             "ip": ip,
+            "profile": profile,
             "created_at": now,
         }
 
@@ -357,9 +490,7 @@ async def create_pairing_session(request: Request) -> JSONResponse:
         {
             "payload": link,
             "profile": profile,
-            "expires_at": datetime.fromtimestamp(
-                expires_at, tz=timezone.utc
-            ).isoformat(),
+            "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
         },
         headers=_NO_STORE,
     )
@@ -367,11 +498,9 @@ async def create_pairing_session(request: Request) -> JSONResponse:
 
 @router.post("/api/alice/pairing/claim")
 async def claim_pairing(request: Request) -> JSONResponse:
-    """Exchange the QR's one-time token for the configuration. Public route;
-    the offer store and the source gate are the boundary."""
+    """Exchange the QR bearer exactly once for long-lived configuration."""
     ip = _source_ip(request)
-    allow_lan = bool(_pairing_setting(request, "allow_lan", False))
-    if not _origin_allowed(ip, allow_lan):
+    if _has_forwarding_headers(request) or not _origin_allowed(ip):
         audit_log(AuditEvent.PAIRING_CLAIM_REJECTED, ip=ip, reason="origin")
         return JSONResponse({"error": "forbidden"}, status_code=403, headers=_NO_STORE)
     if _claim_rate_limited(ip):
@@ -380,15 +509,16 @@ async def claim_pairing(request: Request) -> JSONResponse:
             {"error": "rate_limited"}, status_code=429, headers=_NO_STORE
         )
 
-    body = await request.body()
-    if len(body) > CLAIM_BODY_MAX_BYTES:
+    body = await _read_body_limited(request, CLAIM_BODY_MAX_BYTES)
+    if body is None:
         return JSONResponse({"error": "unknown"}, status_code=404, headers=_NO_STORE)
     try:
         parsed = _ClaimBody.model_validate(json.loads(body))
-    except Exception:  # noqa: BLE001 — no oracle: any bad body is "unknown"
+    except Exception:  # noqa: BLE001 — no parser oracle: every bad body is unknown
         return JSONResponse({"error": "unknown"}, status_code=404, headers=_NO_STORE)
 
     now = time.time()
+    config: Optional[Dict[str, Any]] = None
     with _lock:
         entry = _offers.get(parsed.token)
         if entry is None:
@@ -399,8 +529,12 @@ async def claim_pairing(request: Request) -> JSONResponse:
             del _offers[parsed.token]
             outcome = "expired"
         else:
-            entry["used"] = True
-            outcome = "ok"
+            config = entry.get("config")
+            if config is None:
+                outcome = "unknown"
+            else:
+                _offers[parsed.token] = _tombstone(entry)
+                outcome = "ok"
 
     if outcome != "ok":
         audit_log(AuditEvent.PAIRING_CLAIM_REJECTED, ip=ip, reason=outcome)
@@ -410,4 +544,4 @@ async def claim_pairing(request: Request) -> JSONResponse:
     device_name = _sanitize_device_name(parsed.device_name)
     audit_log(AuditEvent.PAIRING_CLAIMED, ip=ip, device=device_name)
     _log.info("alice pairing: claimed by %s", device_name)
-    return JSONResponse(entry["config"], headers=_NO_STORE)
+    return JSONResponse(config, headers=_NO_STORE)

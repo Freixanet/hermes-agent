@@ -1099,10 +1099,15 @@ export const api = {
   // rewrite in withManagementProfile doesn't reach them — send it explicitly
   // or an approval lands in the wrong profile's whitelist.
   getPairing: () => fetchJSON<PairingResponse>("/api/pairing"),
-  // Mint one Alice QR-pairing offer: a signed alice:// deep link the dialog
-  // renders as a QR code for the iPhone Camera (protocol: Alice docs/pairing.md).
-  startAlicePairing: () =>
-    fetchJSON<AlicePairingSession>("/api/alice/pairing/session", { method: "POST" }),
+  // Mint one Alice v1 QR-pairing offer for the dashboard's selected management
+  // profile. /api/alice/pairing is not part of the generic profile-rewrite
+  // prefix list, so thread the profile explicitly rather than silently pairing
+  // the dashboard process's own profile.
+  startAlicePairing: (profile = getManagementProfile()) =>
+    fetchJSON<AlicePairingSession>(
+      appendProfileParam("/api/alice/pairing/session", profile),
+      { method: "POST" },
+    ),
   approvePairing: (platform: string, request_id: string) =>
     fetchJSON<{ ok: boolean; user: PairingUser }>("/api/pairing/approve", {
       method: "POST",
