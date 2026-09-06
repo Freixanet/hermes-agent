@@ -40,6 +40,10 @@ class AuditEvent(enum.Enum):
     NATIVE_CODE_ISSUED = "native_code_issued"
     NATIVE_TOKEN_SUCCESS = "native_token_success"
     NATIVE_TOKEN_FAILURE = "native_token_failure"
+    # Alice iOS QR device-pairing (alice://pair deep link -> one-time claim).
+    PAIRING_SESSION_CREATED = "pairing_session_created"
+    PAIRING_CLAIMED = "pairing_claimed"
+    PAIRING_CLAIM_REJECTED = "pairing_claim_rejected"
 
 
 def _resolve_log_path() -> Path:

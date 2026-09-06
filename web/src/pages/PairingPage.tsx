@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { Check, ShieldCheck, Trash2, Users, X } from "lucide-react";
+import { Check, ShieldCheck, Smartphone, Trash2, Users, X } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -7,6 +7,7 @@ import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
 import type { PairingResponse, PairingUser } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { PairDeviceDialog } from "@/components/PairDeviceDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
 import { Toast } from "@nous-research/ui/ui/components/toast";
@@ -33,6 +34,7 @@ export default function PairingPage() {
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [pairDeviceOpen, setPairDeviceOpen] = useState(false);
   const { toast, showToast } = useToast();
   const { setEnd } = usePageHeader();
 
@@ -138,6 +140,32 @@ export default function PairingPage() {
   return (
     <div className="flex flex-col gap-6">
       <Toast toast={toast} />
+
+      <PairDeviceDialog
+        open={pairDeviceOpen}
+        onClose={() => setPairDeviceOpen(false)}
+      />
+
+      {/* Connect Alice — QR device pairing for the iOS app */}
+      <Card>
+        <CardContent className="flex items-center gap-4 py-4">
+          <Smartphone className="h-5 w-5 shrink-0 text-muted-foreground" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium">Connect Alice</div>
+            <div className="text-xs text-muted-foreground">
+              Show a one-time QR code so the Alice iPhone app can pair with
+              this Hermes — no addresses, ports or keys to copy.
+            </div>
+          </div>
+          <Button
+            size="sm"
+            className="uppercase"
+            onClick={() => setPairDeviceOpen(true)}
+          >
+            Pair device
+          </Button>
+        </CardContent>
+      </Card>
 
       <DeleteConfirmDialog
         open={userRevoke.isOpen}

@@ -1099,6 +1099,10 @@ export const api = {
   // rewrite in withManagementProfile doesn't reach them — send it explicitly
   // or an approval lands in the wrong profile's whitelist.
   getPairing: () => fetchJSON<PairingResponse>("/api/pairing"),
+  // Mint one Alice QR-pairing offer: a signed alice:// deep link the dialog
+  // renders as a QR code for the iPhone Camera (protocol: Alice docs/pairing.md).
+  startAlicePairing: () =>
+    fetchJSON<AlicePairingSession>("/api/alice/pairing/session", { method: "POST" }),
   approvePairing: (platform: string, request_id: string) =>
     fetchJSON<{ ok: boolean; user: PairingUser }>("/api/pairing/approve", {
       method: "POST",
@@ -1610,6 +1614,13 @@ export interface PairingUser {
 export interface PairingResponse {
   pending: PairingUser[];
   approved: PairingUser[];
+}
+
+export interface AlicePairingSession {
+  /** The alice://pair deep link — render as a QR, never log it. */
+  payload: string;
+  profile: string;
+  expires_at: string;
 }
 
 export interface WebhookRoute {
