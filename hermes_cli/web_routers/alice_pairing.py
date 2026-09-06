@@ -5,9 +5,20 @@ The dashboard is the Mac side of the v1 handshake documented in Alice's
 operator shows it as a QR code, and the phone exchanges the bearer token
 exactly once for gateway + optional dashboard credentials.
 
-Nothing is persisted. Offers live only in this process; restarting the
-dashboard invalidates every outstanding code. The QR contains only the
-short-lived claim token, never Hermes' long-lived credentials.
+Pairing always targets the installation's MAIN profile — the one
+``profiles.list`` reports as ``is_default`` (the HERMES_HOME root; the
+profiles the operator calls "bots" are named profiles). The dashboard's
+selected profile and the sticky active profile never decide who Alice is.
+When the main profile has no running gateway, the session endpoint
+provisions one idempotently: missing ``API_SERVER_KEY``/``API_SERVER_PORT``/
+``API_SERVER_HOST`` are created in the profile's ``.env`` (existing values
+are never overwritten), the launchd service is installed and started, and a
+localhost-bound gateway is published inside the tailnet through Tailscale
+Serve. Nothing outside this module's own port and entries is ever touched.
+
+Nothing about the offer is persisted. Offers live only in this process;
+restarting the dashboard invalidates every outstanding code. The QR contains
+only the short-lived claim token, never Hermes' long-lived credentials.
 
 Routes:
 
@@ -23,12 +34,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import http.client
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -41,7 +55,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
-from hermes_cli.web_deps import late
+from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers._common import http_failure
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -52,10 +66,18 @@ _require_token = late("_require_token")
 load_config = late("load_config", "hermes_cli.config")
 cfg_get = late("cfg_get", "hermes_cli.config")
 get_env_value_prefer_dotenv = late("get_env_value_prefer_dotenv", "hermes_cli.config")
+save_env_value = late("save_env_value", "hermes_cli.config")
+list_profiles = late("list_profiles", "hermes_cli.profiles")
+set_active_profile = late("set_active_profile", "hermes_cli.profiles")
 get_active_profile = late("get_active_profile", "hermes_cli.profiles")
-normalize_profile_name = late("normalize_profile_name", "hermes_cli.profiles")
-validate_profile_name = late("validate_profile_name", "hermes_cli.profiles")
-profile_exists = late("profile_exists", "hermes_cli.profiles")
+launchd_install = late("launchd_install", "hermes_cli.gateway")
+launchd_start = late("launchd_start", "hermes_cli.gateway")
+stop_profile_gateway = late("stop_profile_gateway", "hermes_cli.gateway")
+_timestamped_stderr_gateway_command = late(
+    "_timestamped_stderr_gateway_command", "hermes_cli.gateway"
+)
+save_config = late("save_config", "hermes_cli.config")
+_CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 
 OFFER_TTL_SECONDS = 300
 MAX_PENDING_OFFERS = 256
@@ -63,6 +85,10 @@ MAX_PENDING_PER_IP = 8
 CLAIM_BODY_MAX_BYTES = 4096
 CLAIM_RATE_MAX_PER_WINDOW = 30
 CLAIM_RATE_WINDOW_SEC = 60.0
+# Candidate ports for a freshly provisioned main-profile gateway. The first
+# one that actually binds on 127.0.0.1 wins and is persisted in the profile's
+# .env; 8642 is deliberately absent because bot-profile gateways claim it.
+MAIN_GATEWAY_PORT_CANDIDATES = range(8643, 8670)
 
 _lock = threading.Lock()
 # token -> {expires_at, config?, used, ip, profile, created_at}
@@ -133,10 +159,32 @@ def _tailscale_ipv4() -> Optional[str]:
     if proc.returncode != 0:
         return None
     try:
-        ips = json.loads(proc.stdout).get("Self", {}).get("TailscaleIPs") or []
+        data = json.loads(proc.stdout)
     except ValueError:
         return None
+    ips = data.get("Self", {}).get("TailscaleIPs") or []
     return next((ip for ip in ips if _is_ipv4(ip)), None)
+
+
+def _tailscale_dns_name() -> Optional[str]:
+    """This Mac's MagicDNS name (``machine.tailnet.ts.net``), the stable
+    tailnet hostname — preferable to advertising a raw IP."""
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        name = json.loads(proc.stdout).get("Self", {}).get("DNSName") or ""
+    except ValueError:
+        return None
+    return name.rstrip(".").strip() or None
 
 
 def _pairing_setting(request: Request, key: str, default: Any) -> Any:
@@ -148,19 +196,404 @@ def _pairing_setting(request: Request, key: str, default: Any) -> Any:
     return cfg_get(config, "dashboard", "alice_pairing", key, default=default)
 
 
-def _selected_profile(request: Request) -> str:
-    """Use the dashboard's explicit management profile when supplied."""
-    requested = request.query_params.get("profile")
-    if not requested:
-        return get_active_profile() or "default"
+@contextlib.contextmanager
+def _main_profile_scope(profile: str):
+    """Pin Hermes' profile-aware helpers to the main profile's home.
+
+    The dashboard process inherits the sticky ACTIVE profile as its implicit
+    scope, so plain ``save_env_value`` / ``load_env`` / gateway-service
+    suffixes would resolve to whichever bot is currently active — exactly the
+    profile this feature must never touch. Inside this block every
+    home-derived resolution (env path, launchd plist, credential reads)
+    points at the main profile's HERMES_HOME (the installation root).
+    """
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_profile_dir(profile))
     try:
-        profile = normalize_profile_name(requested)
-        validate_profile_name(profile)
-    except Exception as exc:  # noqa: BLE001 — ingress validation fails closed
-        raise HTTPException(status_code=400, detail="Invalid Hermes profile") from exc
-    if not profile_exists(profile):
-        raise HTTPException(status_code=404, detail="Hermes profile not found")
-    return profile
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _resolve_main_profile() -> Tuple[str, str]:
+    """Resolve the installation's MAIN profile — the one Alice's Home chat
+    talks to.
+
+    The canonical rule is ``profiles.list``'s own ``is_default`` flag: the
+    HERMES_HOME root profile, display name from its ``profile.yaml``. The
+    dashboard's currently-selected profile and the sticky active profile both
+    follow the operator's current bot and must never decide who Alice is.
+    """
+    profiles = [p for p in (list_profiles() or []) if getattr(p, "is_default", False)]
+    if not profiles:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No default Hermes profile was found on this installation, so "
+                "there is no main agent for Alice to pair with."
+            ),
+        )
+    main = profiles[0]
+    return main.name, (getattr(main, "display_name", "") or "").strip()
+
+
+def _main_gateway_running(profile: str) -> bool:
+    """Whether the main profile's gateway is alive, per the same runtime
+    checks (pid file / state file) the rest of Hermes uses."""
+    return any(
+        getattr(p, "name", None) == profile and getattr(p, "gateway_running", False)
+        for p in (list_profiles() or [])
+    )
+
+
+def _allocate_gateway_port() -> int:
+    """First localhost port from the candidate range that is actually free."""
+    for port in MAIN_GATEWAY_PORT_CANDIDATES:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "No free local port was available for the main Hermes gateway "
+            f"({MAIN_GATEWAY_PORT_CANDIDATES.start}-{MAIN_GATEWAY_PORT_CANDIDATES.stop - 1})."
+        ),
+    )
+
+
+def _port_bindable(address: str, port: int) -> bool:
+    """Whether a server could actually bind (address, port) right now."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((address, port))
+        return True
+    except OSError:
+        return False
+
+
+def _provision_main_gateway_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Create or reconcile the main-gateway settings in the profile's
+    ``.env``. The gateway key is never rotated; host and port are reconciled
+    only when they cannot describe a workable localhost gateway (the caller
+    provisions exclusively while the main gateway is NOT running, so nothing
+    live depends on the old values). Returns exactly what was written.
+    """
+    writes: Dict[str, str] = {}
+    if not (env.get("API_SERVER_KEY") or "").strip():
+        writes["API_SERVER_KEY"] = secrets.token_urlsafe(48)
+
+    host = (env.get("API_SERVER_HOST") or "").strip().strip("[]").lower()
+    # Exposure is Tailscale Serve's job; a direct bind to a routable address
+    # (often a stale, hardcoded tailnet IP) would bypass the tailnet-only
+    # path this feature promises.
+    if host not in {"127.0.0.1", "localhost", "0.0.0.0", "::"}:
+        if host:
+            _log.info(
+                "alice pairing: replacing non-local API_SERVER_HOST %r with 127.0.0.1",
+                host,
+            )
+        writes["API_SERVER_HOST"] = "127.0.0.1"
+        host = "127.0.0.1"
+    elif not host:
+        writes["API_SERVER_HOST"] = "127.0.0.1"
+        host = "127.0.0.1"
+
+    port = _valid_port(env.get("API_SERVER_PORT"))
+    if port is None or not _port_bindable(host, port):
+        if port is not None:
+            _log.info(
+                "alice pairing: API_SERVER_PORT %s is not bindable; allocating a free one",
+                port,
+            )
+        writes["API_SERVER_PORT"] = str(_allocate_gateway_port())
+
+    for key, value in writes.items():
+        save_env_value(key, value)
+        # The name is safe to log; the value never is.
+        _log.info("alice pairing: provisioned %s for the main gateway", key)
+    return writes
+
+
+def _clear_stale_gateway_runtime_state() -> None:
+    """Remove runtime-only markers a dead gateway left behind: a persisted
+    "running" state makes Hermes' foreground guard believe a supervised copy
+    is still alive and refuse every start."""
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    for name in ("gateway.pid", "gateway_state.json"):
+        with contextlib.suppress(OSError):
+            (home / name).unlink(missing_ok=True)
+
+
+def _spawn_detached_gateway_forced(
+    env_overrides: Dict[str, str], profile: str
+) -> bool:
+    """Start the gateway detached with the supervisor-conflict guard forced.
+
+    On hosts where the launchd domain cannot bootstrap the gateway (macOS 26
+    exit 5/125 — Hermes records it in ``.gateway-launchd-unsupported``), the
+    installed plist can never actually run while it still makes the plain
+    foreground guard refuse starts. This mirrors Hermes' own detached
+    fallback with ``--force``, the workaround Hermes itself prints.
+
+    The child runs with ``--profile <main>``: the sticky ACTIVE profile (a
+    bot) would otherwise define the child's env scope and it would bind the
+    BOT's gateway port instead of the main profile's. ``env_overrides``
+    carries the provisioned settings so a stale hydrated environ in the
+    spawning dashboard cannot leak into the child either.
+    """
+    from hermes_constants import get_hermes_home
+
+    log_dir = Path(get_hermes_home()) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    argv = _timestamped_stderr_gateway_command(log_dir / "gateway.error.log")
+    # The inner command is the tail after the "--" separator: insert the
+    # profile right after the hermes_cli.main module, before the subcommand.
+    sep = argv.index("--")
+    inner_module = argv.index("hermes_cli.main", sep)
+    argv = (
+        argv[: inner_module + 1]
+        + ["--profile", profile]
+        + argv[inner_module + 1 :]
+        + ["--force"]
+    )
+    env = {**os.environ, **env_overrides}
+    try:
+        with open(log_dir / "gateway.log", "ab") as out:
+            subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+    except OSError:
+        return False
+    return True
+
+
+def _launchd_domain_known_broken() -> bool:
+    """True when Hermes has recorded that launchd cannot supervise gateways
+    on this host (macOS 26 exit 5/125)."""
+    from hermes_cli.gateway import _launchd_unsupported_marker_exists
+
+    return _launchd_unsupported_marker_exists()
+
+
+def _env_flag_truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _set_dashboard_key(key: str, value: Any) -> None:
+    """Write one ``dashboard.<key>`` config value under the same mutation
+    lock every dashboard config route uses."""
+    with _CONFIG_MUTATION_LOCK:
+        config = load_config()
+        dashboard = config.get("dashboard")
+        if not isinstance(dashboard, dict):
+            dashboard = {}
+            config["dashboard"] = dashboard
+        dashboard[key] = value
+        save_config(config)
+
+
+def _keep_chat_only_platforms(env: Dict[str, str]) -> None:
+    """The pairing-provisioned main gateway serves chat only.
+
+    Messaging platforms belong to the bot profiles: two gateways sharing a
+    platform token fight over the same polling session for ever (and the
+    supervised side revives itself after every kill). Platforms the operator
+    explicitly enabled in config.yaml are never touched — that is their
+    decision and their war to manage — but implicit enablements (a token in
+    the profile's .env, a session-file flag) are turned off and logged.
+    """
+    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+    # Session/file platforms authenticate outside the token map; their env
+    # flags are the implicit enablement to look for.
+    env_flag_platforms = {
+        "whatsapp": "WHATSAPP_ENABLED",
+        "webhook": "WEBHOOK_ENABLED",
+        "msgraph_webhook": "MSGRAPH_WEBHOOK_ENABLED",
+    }
+
+    with _CONFIG_MUTATION_LOCK:
+        config = load_config()
+        platforms = config.get("platforms")
+        if not isinstance(platforms, dict):
+            platforms = {}
+            config["platforms"] = platforms
+
+        candidates = set(PLATFORM_TOKEN_ENV_NAMES) | set(env_flag_platforms) | {
+            name for name, block in platforms.items()
+            if isinstance(block, dict) and block.get("enabled") is True
+        }
+        candidates.discard("api_server")
+
+        def _config_name(platform: Any) -> str:
+            # PLATFORM_TOKEN_ENV_NAMES is keyed by the Platform enum; config
+            # blocks (and yaml) use the plain name.
+            return str(getattr(platform, "value", platform))
+
+        touched: list[str] = []
+        for platform in sorted(candidates, key=_config_name):
+            name = _config_name(platform)
+            block = platforms.get(name)
+            if isinstance(block, dict) and "enabled" in block:
+                continue  # the operator decided; not ours to flip
+            token_env = PLATFORM_TOKEN_ENV_NAMES.get(platform)
+            flag_env = env_flag_platforms.get(name)
+            if name not in platforms and not (
+                (token_env and (env.get(token_env) or "").strip())
+                or (flag_env and _env_flag_truthy(env.get(flag_env)))
+            ):
+                continue  # no credential, no flag: the platform is off already
+            platforms[name] = {**(block if isinstance(block, dict) else {}), "enabled": False}
+            touched.append(name)
+
+        if touched:
+            save_config(config)
+            _log.info(
+                "alice pairing: main gateway runs chat-only (disabled platforms: %s)",
+                ", ".join(touched),
+            )
+
+
+def _stop_named_profile_gateway(name: str) -> None:
+    """Stop a named profile's gateway and unload its launchd agent so
+    KeepAlive cannot revive it against the main gateway. The plist file is
+    never deleted — bootstrapping the agent restores the service."""
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_profile_dir(name))
+    try:
+        stop_profile_gateway()
+    finally:
+        reset_hermes_home_override(token)
+    with contextlib.suppress(Exception):
+        subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.gateway-{name}"],
+            capture_output=True,
+            timeout=30,
+        )
+    _log.info(
+        "alice pairing: stopped bot gateway profile=%s (agent unloaded, plist kept)", name
+    )
+
+
+def _start_main_gateway(
+    profile: str, env_overrides: Optional[Dict[str, str]] = None
+) -> None:
+    """Start the installation's main gateway.
+
+    The pid layer treats the default profile's gateway as THE gateway of the
+    installation, so a bot-profile gateway that is currently up must be
+    stopped first — through Hermes' own stop path, inside the bot's home
+    scope, with its launchd agent unloaded rather than deleted. The launchd
+    service is installed and started unless the domain is recorded as unable
+    to supervise gateways on this host (macOS 26 exit 5/125), in which case a
+    forced detached start runs directly instead of racing the supervisor's
+    own fallback spawn. The caller verifies liveness either way;
+    ``env_overrides`` pins the provisioned gateway settings for the child.
+    """
+    for entry in list_profiles() or []:
+        if getattr(entry, "is_default", False):
+            continue
+        if getattr(entry, "gateway_running", False):
+            _stop_named_profile_gateway(entry.name)
+
+    overrides = dict(env_overrides or {})
+    if not _launchd_domain_known_broken():
+        launchd_install(False)
+        try:
+            launchd_start()
+        except SystemExit:
+            # Hermes' launchd-unsupported path may exit the CLI; the forced
+            # detached start below is the supported way forward.
+            pass
+        if _main_gateway_running(profile):
+            return
+    _clear_stale_gateway_runtime_state()
+    if not _spawn_detached_gateway_forced(overrides, profile):
+        raise HTTPException(
+            status_code=503,
+            detail="Could not start the main Hermes gateway in the background.",
+        )
+
+
+def _await_gateway_socket(address: str, port: int, timeout: float = 90.0) -> None:
+    """Wait for a freshly started gateway to accept TCP connections before
+    the authoritative authenticated probe runs. Plugin discovery makes cold
+    boots slow; a refused socket is retried until the deadline."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.create_connection((address, port), timeout=2.0):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "The main Hermes gateway did not become reachable after "
+                        "being started. Check its launchd logs and try again."
+                    ),
+                ) from None
+            time.sleep(1.0)
+
+
+def _ensure_tailscale_forward(port: int) -> None:
+    """Publish a localhost-bound gateway inside the tailnet, idempotently.
+
+    Only the forward for THIS port is touched: existing forwards (including
+    any other service's) and funnel settings are left alone. A stale entry on
+    the same listen port converges to the gateway's own target, since that
+    port belongs to the gateway we just provisioned.
+    """
+    current = _tailscale_tcp_forward_target(port)
+    if current and current.lower().removeprefix("tcp://") in {
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+    }:
+        return
+    result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        [
+            "tailscale",
+            "serve",
+            "--bg",
+            "--yes",
+            "--tcp",
+            str(port),
+            f"tcp://127.0.0.1:{port}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Tailscale Serve could not publish the gateway port "
+                f"{port} inside the tailnet{(': ' + result.stderr.strip()) if result.stderr.strip() else '.'} "
+                "Without it, the iPhone cannot reach a localhost-bound gateway."
+            ),
+        )
+    _log.info("alice pairing: tailscale serve tcp forward ensured on port %s", port)
 
 
 def _is_ipv4(value: str) -> bool:
@@ -220,11 +653,27 @@ def _origin_allowed(ip: str) -> bool:
     )
 
 
-def _dashboard_reachable_on(address: str, bound_host: Any) -> bool:
-    """The claim URL must be reachable directly on the host Alice is given."""
+def _dashboard_reachable_on(address: str, bound_host: Any, bound_port: int) -> bool:
+    """The claim URL must be reachable directly on the host Alice is given.
+
+    A wildcard bind is reachable everywhere; a matching bind is trivially so.
+    A loopback-bound dashboard is also reachable when Tailscale Serve
+    publishes this exact port back to loopback — the documented setup
+    (``tailscale serve --tcp <port> tcp://127.0.0.1:<port>``), in which the
+    tailnet path is Serve's and the dashboard never needs a routable bind.
+    """
     bound = str(bound_host or "127.0.0.1").strip().strip("[]").rstrip(".").lower()
     advertised = address.rstrip(".").lower()
-    return bound in {"0.0.0.0", "::"} or bound == advertised
+    if bound in {"0.0.0.0", "::"} or bound == advertised:
+        return True
+    if bound in {"127.0.0.1", "localhost", ""}:
+        target = _tailscale_tcp_forward_target(bound_port)
+        if target and target.lower().removeprefix("tcp://") in {
+            f"127.0.0.1:{bound_port}",
+            f"localhost:{bound_port}",
+        }:
+            return True
+    return False
 
 
 def _valid_port(raw: Any) -> Optional[int]:
@@ -233,6 +682,58 @@ def _valid_port(raw: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return port if 1 <= port <= 65535 else None
+
+
+def _tailscale_tcp_forward_target(port: int) -> Optional[str]:
+    """Return the local target of a Tailscale Serve TCP forward, if configured."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    tcp = payload.get("TCP")
+    if not isinstance(tcp, dict):
+        return None
+
+    rule = tcp.get(str(port))
+    if not isinstance(rule, dict):
+        return None
+
+    target = rule.get("TCPForward")
+    if not isinstance(target, str) or not target.strip():
+        return None
+
+    return target.strip()
+
+
+def _gateway_probe_address(
+    advertised_address: str, port: int, env: Dict[str, str]
+) -> str:
+    """Probe localhost when Tailscale Serve publishes the local gateway."""
+    bound = (env.get("API_SERVER_HOST") or "").strip().strip("[]").lower()
+
+    if bound in {"127.0.0.1", "localhost"}:
+        target = _tailscale_tcp_forward_target(port)
+        if target:
+            normalized = target.lower().removeprefix("tcp://")
+            if normalized in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+                return "127.0.0.1"
+
+    return advertised_address
 
 
 def _probe_gateway(address: str, port: int, key: str) -> None:
@@ -307,26 +808,79 @@ def _reset_claim_state_for_tests() -> None:
 
 async def _build_pairing_config(
     request: Request,
-) -> Tuple[Dict[str, Any], str, str]:
-    """Assemble and validate exactly the configuration Alice will receive."""
-    profile = _selected_profile(request)
+) -> Tuple[Dict[str, Any], str, str, str]:
+    """Assemble and validate exactly the configuration Alice will receive.
+
+    Always targets the installation's MAIN profile, and provisions its
+    gateway when the installation does not run one yet: missing gateway
+    settings are created, the launchd service is installed and started
+    (idempotently, never restarting a live gateway), and a localhost-bound
+    gateway is published inside the tailnet through Tailscale Serve.
+    """
+    profile, display_name = await asyncio.to_thread(_resolve_main_profile)
+    with _main_profile_scope(profile):
+        config, address = await _build_main_profile_config(request, profile)
+    if display_name:
+        config["profile_display_name"] = display_name
+    return config, profile, address, display_name
+
+
+async def _build_main_profile_config(
+    request: Request, profile: str
+) -> Tuple[Dict[str, Any], str]:
+    """The provisioning sequence, run inside the main profile's scope."""
     env = await asyncio.to_thread(_read_profile_env, profile)
+    writes = await asyncio.to_thread(_provision_main_gateway_env, env)
+    env = {**env, **writes}
+
     key = env.get("API_SERVER_KEY")
     if not key:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"No gateway key found for profile '{profile}' "
-                "(API_SERVER_KEY in its .env). Start the gateway for this "
-                "profile, then try again."
+                f"The main profile '{profile}' has no gateway key "
+                "(API_SERVER_KEY in its .env) and it could not be provisioned."
             ),
         )
     gateway_port = _valid_port(env.get("API_SERVER_PORT") or 8642)
     if gateway_port is None:
         raise HTTPException(status_code=503, detail="The Hermes gateway port is invalid.")
 
+    if not await asyncio.to_thread(_main_gateway_running, profile):
+        # Applied before the first start so the main gateway boots chat-only.
+        await asyncio.to_thread(_keep_chat_only_platforms, env)
+        # The sticky active profile defines the env scope profile-aware
+        # helpers read (gateway port, platform tokens). While it points at a
+        # bot, every layer of the spawned gateway resolves to that bot — so
+        # the installation's main profile becomes the active one, which is
+        # what "this Hermes' main agent" means operationally.
+        if (get_active_profile() or "") != profile:
+            await asyncio.to_thread(set_active_profile, profile)
+        # Pin the provisioned settings AND the main profile's home for the
+        # child: the spawning dashboard's environ can carry a stale hydrated
+        # API_SERVER_PORT and even an ambient HERMES_HOME pointing at a bot
+        # profile — without this pin the spawn resurrects that bot's gateway.
+        from hermes_constants import get_hermes_home
+
+        overrides = {
+            name: (env.get(name) or "")
+            for name in ("API_SERVER_HOST", "API_SERVER_PORT", "API_SERVER_KEY")
+        }
+        overrides["HERMES_HOME"] = str(get_hermes_home())
+        overrides["API_SERVER_ENABLED"] = "true"
+        await asyncio.to_thread(
+            _start_main_gateway,
+            profile,
+            overrides,
+        )
+
     configured_address = _pairing_setting(request, "address", None)
-    raw_address = configured_address or await asyncio.to_thread(_tailscale_ipv4)
+    # Prefer the MagicDNS name (stable across addresses) over a raw IP.
+    raw_address = (
+        configured_address
+        or await asyncio.to_thread(_tailscale_dns_name)
+        or await asyncio.to_thread(_tailscale_ipv4)
+    )
     address = _validated_advertised_host(raw_address)
     if not address:
         raise HTTPException(
@@ -342,17 +896,35 @@ async def _build_pairing_config(
     if bound_port is None:
         raise HTTPException(status_code=503, detail="The dashboard port is invalid.")
     bound_host = getattr(request.app.state, "bound_host", "127.0.0.1")
-    if not _dashboard_reachable_on(address, bound_host):
+    if not await asyncio.to_thread(
+        _dashboard_reachable_on, address, bound_host, bound_port
+    ):
         raise HTTPException(
             status_code=503,
             detail=(
-                "The dashboard is bound to a local-only address, so this iPhone cannot "
-                "reach the pairing claim endpoint. Bind the dashboard to the Tailscale-"
-                "reachable interface (for example 0.0.0.0 with dashboard auth enabled)."
+                "The dashboard is bound to a local-only address and no Tailscale "
+                "Serve forward publishes this port, so this iPhone cannot reach "
+                "the pairing claim endpoint. Run 'tailscale serve --bg --tcp "
+                f"{bound_port} tcp://127.0.0.1:{bound_port}' or bind the "
+                "dashboard to the Tailscale-reachable interface."
             ),
         )
+    # Alice's dashboard login sends the advertised address as its Host header,
+    # and the dashboard's anti-rebinding check accepts exactly the configured
+    # public hostname. Record it once; never overwrite an operator value.
+    if not (cfg_get(load_config(), "dashboard", "public_url", default="") or "").strip():
+        _set_dashboard_key("public_url", f"http://{address}:{bound_port}")
 
-    await asyncio.to_thread(_probe_gateway, address, gateway_port, key)
+    # A localhost-bound gateway is only reachable from the phone through a
+    # Tailscale Serve TCP forward; make sure it exists before probing.
+    bound = (env.get("API_SERVER_HOST") or "").strip().strip("[]").lower()
+    if bound in {"127.0.0.1", "localhost", ""}:
+        await asyncio.to_thread(_ensure_tailscale_forward, gateway_port)
+
+    probe_address = _gateway_probe_address(address, gateway_port, env)
+    if not await asyncio.to_thread(_main_gateway_running, profile):
+        await asyncio.to_thread(_await_gateway_socket, probe_address, gateway_port)
+    await asyncio.to_thread(_probe_gateway, probe_address, gateway_port, key)
 
     config: Dict[str, Any] = {
         "profile": profile,
@@ -367,7 +939,7 @@ async def _build_pairing_config(
             "username": username,
             "password": password,
         }
-    return config, profile, address
+    return config, address
 
 
 class _ClaimBody(BaseModel):
@@ -433,7 +1005,7 @@ async def create_pairing_session(request: Request) -> JSONResponse:
         503,
         detail="Could not assemble the pairing configuration.",
     ):
-        config, profile, address = await _build_pairing_config(request)
+        config, profile, address, display_name = await _build_pairing_config(request)
 
     token = secrets.token_urlsafe(24)
     now = time.time()
@@ -490,6 +1062,7 @@ async def create_pairing_session(request: Request) -> JSONResponse:
         {
             "payload": link,
             "profile": profile,
+            "profile_display_name": display_name,
             "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
         },
         headers=_NO_STORE,

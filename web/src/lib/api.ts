@@ -1099,15 +1099,11 @@ export const api = {
   // rewrite in withManagementProfile doesn't reach them — send it explicitly
   // or an approval lands in the wrong profile's whitelist.
   getPairing: () => fetchJSON<PairingResponse>("/api/pairing"),
-  // Mint one Alice v1 QR-pairing offer for the dashboard's selected management
-  // profile. /api/alice/pairing is not part of the generic profile-rewrite
-  // prefix list, so thread the profile explicitly rather than silently pairing
-  // the dashboard process's own profile.
-  startAlicePairing: (profile = getManagementProfile()) =>
-    fetchJSON<AlicePairingSession>(
-      appendProfileParam("/api/alice/pairing/session", profile),
-      { method: "POST" },
-    ),
+  // Mint one Alice v1 QR-pairing offer. Deliberately profile-less: the server
+  // resolves the installation's MAIN profile (profiles.list is_default) — the
+  // dashboard's selected profile must never decide who Alice pairs with.
+  startAlicePairing: () =>
+    fetchJSON<AlicePairingSession>("/api/alice/pairing/session", { method: "POST" }),
   approvePairing: (platform: string, request_id: string) =>
     fetchJSON<{ ok: boolean; user: PairingUser }>("/api/pairing/approve", {
       method: "POST",
@@ -1624,7 +1620,10 @@ export interface PairingResponse {
 export interface AlicePairingSession {
   /** The alice://pair deep link — render as a QR, never log it. */
   payload: string;
+  /** Canonical main-profile name (always the installation's default). */
   profile: string;
+  /** Friendly name from the main profile's profile.yaml, when set. */
+  profile_display_name?: string;
   expires_at: string;
 }
 

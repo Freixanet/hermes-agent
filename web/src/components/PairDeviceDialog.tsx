@@ -188,8 +188,9 @@ export function PairDeviceDialog({
                 </Button>
               </div>
               <p className="text-center text-[11px] text-muted-foreground">
-                One-time code for profile {session.profile}. Creating a new code
-                invalidates the previous one.
+                One-time code for{" "}
+                {session.profile_display_name || session.profile}. Creating a
+                new code invalidates the previous one.
               </p>
             </>
           )}
