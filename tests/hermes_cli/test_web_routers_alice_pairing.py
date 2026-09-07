@@ -112,35 +112,30 @@ def main_installation(monkeypatch):
 
 @pytest.fixture
 def automation(monkeypatch):
-    """Records launchd + Tailscale Serve side effects without touching the
-    system, and stops gateway-socket waits and detached spawns from reaching
-    the network."""
-    calls = {"install": 0, "start": 0, "serve": [], "detached": 0, "spawn_env": None}
+    """Record launchd + Tailscale side effects without touching the host."""
+    calls = {"start": 0, "serve": [], "forwards": {}}
 
     monkeypatch.setattr(
-        alice_pairing, "launchd_install", lambda force: calls.__setitem__("install", calls["install"] + 1)
+        alice_pairing,
+        "launchd_start",
+        lambda: calls.__setitem__("start", calls["start"] + 1),
     )
-    monkeypatch.setattr(alice_pairing, "launchd_start", lambda: calls.__setitem__("start", calls["start"] + 1))
 
     def fake_serve_run(argv, **kwargs):
         calls["serve"].append(list(argv))
+        if len(argv) >= 7 and argv[:2] == ["tailscale", "serve"] and "--tcp" in argv:
+            port = int(argv[argv.index("--tcp") + 1])
+            calls["forwards"][port] = argv[-1]
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(alice_pairing.subprocess, "run", fake_serve_run)
-    monkeypatch.setattr(alice_pairing.subprocess, "Popen", lambda argv, **kwargs: None)
-    monkeypatch.setattr(alice_pairing, "_tailscale_tcp_forward_target", lambda port: None)
-    monkeypatch.setattr(alice_pairing, "_await_gateway_socket", lambda address, port, timeout=30.0: None)
-    monkeypatch.setattr(alice_pairing, "stop_profile_gateway", lambda: None)
-    monkeypatch.setattr(alice_pairing, "_allocate_gateway_port", lambda: 8643)
     monkeypatch.setattr(
         alice_pairing,
-        "_spawn_detached_gateway_forced",
-        lambda env_overrides, profile: (
-            calls.__setitem__("spawn_env", dict(env_overrides or {})),
-            calls.__setitem__("detached", calls["detached"] + 1),
-        )
-        and True,
+        "_tailscale_tcp_forward_target",
+        lambda port: calls["forwards"].get(port),
     )
+    monkeypatch.setattr(alice_pairing, "_await_gateway_socket", lambda address, port, timeout=90.0: None)
+    monkeypatch.setattr(alice_pairing, "_allocate_gateway_port", lambda: 8643)
     return calls
 
 
@@ -276,15 +271,17 @@ class TestSessionEndpoint:
         resp = pairing_client.post(SESSION_URL, headers=_session_headers())
         assert resp.status_code == 503
 
-    def test_loopback_dashboard_without_serve_forward_refuses_to_mint(
-        self, pairing_client, main_installation, monkeypatch
+    def test_loopback_dashboard_without_serve_forward_is_published_automatically(
+        self, pairing_client, main_installation, automation
     ):
         web_server.app.state.bound_host = "127.0.0.1"
-        monkeypatch.setattr(alice_pairing, "_tailscale_tcp_forward_target", lambda port: None)
         headers = {**_session_headers(), "Host": "127.0.0.1:9119"}
         resp = pairing_client.post(SESSION_URL, headers=headers)
-        assert resp.status_code == 503
-        assert "Tailscale" in resp.text
+        assert resp.status_code == 200
+        assert [
+            "tailscale", "serve", "--bg", "--yes", "--tcp", "9119",
+            "tcp://127.0.0.1:9119",
+        ] in automation["serve"]
 
     def test_loopback_dashboard_behind_serve_forward_is_reachable(
         self, pairing_client, main_installation, monkeypatch
@@ -338,27 +335,24 @@ class TestSessionEndpoint:
 
 
 class TestGatewayProvisioning:
-    def test_provisioning_makes_the_main_profile_active(
+    def test_pairing_does_not_change_the_sticky_active_profile(
         self, pairing_client, automation, monkeypatch
     ):
-        """The sticky active profile defines the env scope the spawned
-        gateway reads — leaving it on a bot would resurrect that bot's
-        gateway. Provisioning must move it to the main profile."""
+        """Pairing identity is resolved independently; it must not rewrite the
+        operator's currently active/selected profile as a side effect."""
         home = Path(os.environ["HERMES_HOME"])
         monkeypatch.setattr(
             alice_pairing, "list_profiles", lambda: _fake_profiles(home, main_running=False)
         )
-        monkeypatch.setattr("hermes_cli.profiles.get_active_profile", lambda: "radar-ia")
         monkeypatch.setattr(alice_pairing, "_tailscale_ipv4", lambda: "100.67.213.42")
         monkeypatch.setattr(alice_pairing, "_tailscale_dns_name", lambda: None)
         monkeypatch.setattr(alice_pairing, "_probe_gateway", lambda address, port, key: None)
-        seen = {}
         monkeypatch.setattr(
-            alice_pairing, "set_active_profile", lambda name: seen.__setitem__("active", name)
+            "hermes_cli.profiles.set_active_profile",
+            lambda _name: pytest.fail("pairing must not change the active profile"),
         )
 
-        _mint(pairing_client)
-        assert seen["active"] == "default"
+        assert _mint(pairing_client)["profile"] == "default"
 
     def test_unprovisioned_installation_gets_a_working_gateway(
         self, pairing_client, automation, monkeypatch
@@ -376,17 +370,7 @@ class TestGatewayProvisioning:
 
         body = _mint(pairing_client)
         assert body["profile"] == "default"
-        assert automation["install"] == 1
         assert automation["start"] == 1
-        # The fake profile registry still reports the gateway as not running
-        # after the service start, so the forced detached fallback ran too.
-        assert automation["detached"] == 1
-        # Regression: the child pins the MAIN profile's home — a dashboard
-        # process carrying an ambient bot-profile HERMES_HOME would otherwise
-        # resurrect that bot's gateway instead of starting Alice's.
-        spawn_env = automation["spawn_env"] or {}
-        assert spawn_env.get("HERMES_HOME") == str(home)
-        assert spawn_env.get("API_SERVER_PORT")
 
         env = (home / ".env").read_text(encoding="utf-8")
         assert "API_SERVER_KEY=" in env
@@ -414,7 +398,6 @@ class TestGatewayProvisioning:
 
     def test_running_gateway_is_never_restarted(self, pairing_client, main_installation, automation):
         _mint(pairing_client)
-        assert automation["install"] == 0
         assert automation["start"] == 0
 
     def test_provisioning_is_pinned_to_the_main_profile_home(
@@ -441,13 +424,11 @@ class TestGatewayProvisioning:
         assert "API_SERVER_KEY=" in (home / ".env").read_text(encoding="utf-8")
         assert (bot_home / ".env").read_text(encoding="utf-8") == bot_env_before
 
-    def test_messaging_platforms_are_disabled_for_the_main_gateway(
+    def test_pairing_does_not_rewrite_platform_configuration(
         self, pairing_client, automation, monkeypatch
     ):
-        """The main gateway serves chat only: implicitly-enabled messaging
-        platforms (token in .env, session-file flags) are turned off so it
-        never fights a bot profile over the same polling session. An explicit
-        operator enablement is left exactly as written."""
+        """Provisioning connectivity must not silently disable messaging or
+        otherwise change the operator's platform intent."""
         import yaml
 
         home = Path(os.environ["HERMES_HOME"])
@@ -464,21 +445,35 @@ class TestGatewayProvisioning:
             "platforms:\n  telegram:\n    enabled: true\n",
             encoding="utf-8",
         )
+        before = (yaml.safe_load((home / "config.yaml").read_text()) or {}).get("platforms")
         monkeypatch.setattr(
             alice_pairing, "list_profiles", lambda: _fake_profiles(home, main_running=False)
         )
-        monkeypatch.setattr("hermes_cli.profiles.get_active_profile", lambda: "radar-ia")
         monkeypatch.setattr(alice_pairing, "_tailscale_ipv4", lambda: "100.67.213.42")
+        monkeypatch.setattr(alice_pairing, "_tailscale_dns_name", lambda: None)
         monkeypatch.setattr(alice_pairing, "_probe_gateway", lambda address, port, key: None)
 
         assert _mint(pairing_client)["profile"] == "default"
+        after = (yaml.safe_load((home / "config.yaml").read_text()) or {}).get("platforms")
+        assert after == before
 
-        config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
-        # Explicit operator enablement respected.
-        assert config["platforms"]["telegram"]["enabled"] is True
-        # Implicit enablement (session-file flag) disabled for the main gateway.
-        assert config["platforms"]["whatsapp"]["enabled"] is False
-        assert "api_server" not in config["platforms"]
+    def test_pairing_never_stops_a_running_named_profile_gateway(
+        self, pairing_client, automation, monkeypatch
+    ):
+        home = Path(os.environ["HERMES_HOME"])
+        monkeypatch.setattr(
+            alice_pairing, "list_profiles", lambda: _fake_profiles(home, main_running=False)
+        )
+        monkeypatch.setattr(alice_pairing, "_tailscale_ipv4", lambda: "100.67.213.42")
+        monkeypatch.setattr(alice_pairing, "_tailscale_dns_name", lambda: None)
+        monkeypatch.setattr(alice_pairing, "_probe_gateway", lambda address, port, key: None)
+        monkeypatch.setattr(
+            "hermes_cli.gateway.stop_profile_gateway",
+            lambda: pytest.fail("pairing must not stop sibling profile gateways"),
+        )
+
+        assert _mint(pairing_client)["profile"] == "default"
+        assert automation["start"] == 1
 
     def test_gateway_start_failure_is_503_and_mints_nothing(
         self, pairing_client, automation, monkeypatch
@@ -491,10 +486,10 @@ class TestGatewayProvisioning:
         monkeypatch.setattr(alice_pairing, "_tailscale_ipv4", lambda: "100.67.213.42")
         monkeypatch.setattr(alice_pairing, "_probe_gateway", lambda address, port, key: None)
 
-        def boom(force):
+        def boom():
             raise RuntimeError("launchd refused")
 
-        monkeypatch.setattr(alice_pairing, "launchd_install", boom)
+        monkeypatch.setattr(alice_pairing, "launchd_start", boom)
         resp = pairing_client.post(SESSION_URL, headers=_session_headers())
         assert resp.status_code == 503
         assert alice_pairing._offers == {}
@@ -545,6 +540,15 @@ class TestGatewayProvisioning:
         monkeypatch.setattr(alice_pairing, "_port_bindable", lambda address, port: True)
         assert alice_pairing._provision_main_gateway_env(env) == {}
 
+    def test_live_main_gateway_settings_are_never_reconciled_under_it(self, monkeypatch):
+        env = {
+            "API_SERVER_HOST": "127.0.0.1",
+            "API_SERVER_PORT": "8643",
+            "API_SERVER_KEY": MAIN_KEY,
+        }
+        monkeypatch.setattr(alice_pairing, "_port_bindable", lambda address, port: False)
+        assert alice_pairing._provision_main_gateway_env(env, gateway_running=True) == {}
+
     def test_missing_key_after_provisioning_is_503_not_a_leak(
         self, pairing_client, automation, monkeypatch
     ):
@@ -557,7 +561,7 @@ class TestGatewayProvisioning:
         monkeypatch.setattr("hermes_cli.profiles.get_active_profile", lambda: "radar-ia")
         monkeypatch.setattr(alice_pairing, "_tailscale_ipv4", lambda: "100.67.213.42")
         monkeypatch.setattr(alice_pairing, "_probe_gateway", lambda address, port, key: None)
-        monkeypatch.setattr(alice_pairing, "_provision_main_gateway_env", lambda env: {})
+        monkeypatch.setattr(alice_pairing, "_provision_main_gateway_env", lambda env, **_kwargs: {})
         resp = pairing_client.post(SESSION_URL, headers=_session_headers())
         assert resp.status_code == 503
         assert "API_SERVER_KEY" in resp.json()["detail"]

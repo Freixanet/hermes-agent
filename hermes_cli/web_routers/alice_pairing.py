@@ -11,10 +11,11 @@ profiles the operator calls "bots" are named profiles). The dashboard's
 selected profile and the sticky active profile never decide who Alice is.
 When the main profile has no running gateway, the session endpoint
 provisions one idempotently: missing ``API_SERVER_KEY``/``API_SERVER_PORT``/
-``API_SERVER_HOST`` are created in the profile's ``.env`` (existing values
-are never overwritten), the launchd service is installed and started, and a
-localhost-bound gateway is published inside the tailnet through Tailscale
-Serve. Nothing outside this module's own port and entries is ever touched.
+``API_SERVER_HOST`` are created in the profile's ``.env``; the long-lived key
+is preserved and stale host/port values are reconciled only while that gateway
+is stopped. Hermes' own launchd lifecycle starts the main gateway, and a
+localhost-bound listener is published inside the tailnet through Tailscale
+Serve. Named-profile gateways are never stopped or rewritten by pairing.
 
 Nothing about the offer is persisted. Offers live only in this process;
 restarting the dashboard invalidates every outstanding code. The QR contains
@@ -39,7 +40,6 @@ import http.client
 import ipaddress
 import json
 import logging
-import os
 import re
 import secrets
 import socket
@@ -68,14 +68,7 @@ cfg_get = late("cfg_get", "hermes_cli.config")
 get_env_value_prefer_dotenv = late("get_env_value_prefer_dotenv", "hermes_cli.config")
 save_env_value = late("save_env_value", "hermes_cli.config")
 list_profiles = late("list_profiles", "hermes_cli.profiles")
-set_active_profile = late("set_active_profile", "hermes_cli.profiles")
-get_active_profile = late("get_active_profile", "hermes_cli.profiles")
-launchd_install = late("launchd_install", "hermes_cli.gateway")
 launchd_start = late("launchd_start", "hermes_cli.gateway")
-stop_profile_gateway = late("stop_profile_gateway", "hermes_cli.gateway")
-_timestamped_stderr_gateway_command = late(
-    "_timestamped_stderr_gateway_command", "hermes_cli.gateway"
-)
 save_config = late("save_config", "hermes_cli.config")
 _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 
@@ -279,13 +272,18 @@ def _port_bindable(address: str, port: int) -> bool:
         return False
 
 
-def _provision_main_gateway_env(env: Dict[str, str]) -> Dict[str, str]:
+def _provision_main_gateway_env(
+    env: Dict[str, str], *, gateway_running: bool = False
+) -> Dict[str, str]:
     """Create or reconcile the main-gateway settings in the profile's
-    ``.env``. The gateway key is never rotated; host and port are reconciled
-    only when they cannot describe a workable localhost gateway (the caller
-    provisions exclusively while the main gateway is NOT running, so nothing
-    live depends on the old values). Returns exactly what was written.
+    ``.env``. A live gateway is immutable here: changing its key, host or port
+    underneath the process would make the QR disagree with the listener. When
+    the main gateway is stopped, missing values are created and stale host/port
+    values are reconciled before it starts. Returns exactly what was written.
     """
+    if gateway_running:
+        return {}
+
     writes: Dict[str, str] = {}
     if not (env.get("API_SERVER_KEY") or "").strip():
         writes["API_SERVER_KEY"] = secrets.token_urlsafe(48)
@@ -322,78 +320,6 @@ def _provision_main_gateway_env(env: Dict[str, str]) -> Dict[str, str]:
     return writes
 
 
-def _clear_stale_gateway_runtime_state() -> None:
-    """Remove runtime-only markers a dead gateway left behind: a persisted
-    "running" state makes Hermes' foreground guard believe a supervised copy
-    is still alive and refuse every start."""
-    from hermes_constants import get_hermes_home
-
-    home = Path(get_hermes_home())
-    for name in ("gateway.pid", "gateway_state.json"):
-        with contextlib.suppress(OSError):
-            (home / name).unlink(missing_ok=True)
-
-
-def _spawn_detached_gateway_forced(
-    env_overrides: Dict[str, str], profile: str
-) -> bool:
-    """Start the gateway detached with the supervisor-conflict guard forced.
-
-    On hosts where the launchd domain cannot bootstrap the gateway (macOS 26
-    exit 5/125 — Hermes records it in ``.gateway-launchd-unsupported``), the
-    installed plist can never actually run while it still makes the plain
-    foreground guard refuse starts. This mirrors Hermes' own detached
-    fallback with ``--force``, the workaround Hermes itself prints.
-
-    The child runs with ``--profile <main>``: the sticky ACTIVE profile (a
-    bot) would otherwise define the child's env scope and it would bind the
-    BOT's gateway port instead of the main profile's. ``env_overrides``
-    carries the provisioned settings so a stale hydrated environ in the
-    spawning dashboard cannot leak into the child either.
-    """
-    from hermes_constants import get_hermes_home
-
-    log_dir = Path(get_hermes_home()) / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    argv = _timestamped_stderr_gateway_command(log_dir / "gateway.error.log")
-    # The inner command is the tail after the "--" separator: insert the
-    # profile right after the hermes_cli.main module, before the subcommand.
-    sep = argv.index("--")
-    inner_module = argv.index("hermes_cli.main", sep)
-    argv = (
-        argv[: inner_module + 1]
-        + ["--profile", profile]
-        + argv[inner_module + 1 :]
-        + ["--force"]
-    )
-    env = {**os.environ, **env_overrides}
-    try:
-        with open(log_dir / "gateway.log", "ab") as out:
-            subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=subprocess.DEVNULL,
-                env=env,
-                start_new_session=True,
-            )
-    except OSError:
-        return False
-    return True
-
-
-def _launchd_domain_known_broken() -> bool:
-    """True when Hermes has recorded that launchd cannot supervise gateways
-    on this host (macOS 26 exit 5/125)."""
-    from hermes_cli.gateway import _launchd_unsupported_marker_exists
-
-    return _launchd_unsupported_marker_exists()
-
-
-def _env_flag_truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _set_dashboard_key(key: str, value: Any) -> None:
     """Write one ``dashboard.<key>`` config value under the same mutation
     lock every dashboard config route uses."""
@@ -407,132 +333,24 @@ def _set_dashboard_key(key: str, value: Any) -> None:
         save_config(config)
 
 
-def _keep_chat_only_platforms(env: Dict[str, str]) -> None:
-    """The pairing-provisioned main gateway serves chat only.
+def _start_main_gateway(profile: str) -> None:
+    """Start only the installation's main profile through Hermes' own
+    profile-scoped launchd lifecycle.
 
-    Messaging platforms belong to the bot profiles: two gateways sharing a
-    platform token fight over the same polling session for ever (and the
-    supervised side revives itself after every kill). Platforms the operator
-    explicitly enabled in config.yaml are never touched — that is their
-    decision and their war to manage — but implicit enablements (a token in
-    the profile's .env, a session-file flag) are turned off and logged.
+    Named-profile gateways are independent siblings (the normal Hermes
+    multi-profile topology), so pairing must never stop, unload or rewrite
+    them. ``launchd_start`` self-heals a missing/stale plist and uses Hermes'
+    macOS detached fallback only when launchd itself is unavailable. The
+    caller verifies the resulting socket and authenticated API before minting
+    a QR, so a failed fallback cannot produce a usable offer.
     """
-    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
-
-    # Session/file platforms authenticate outside the token map; their env
-    # flags are the implicit enablement to look for.
-    env_flag_platforms = {
-        "whatsapp": "WHATSAPP_ENABLED",
-        "webhook": "WEBHOOK_ENABLED",
-        "msgraph_webhook": "MSGRAPH_WEBHOOK_ENABLED",
-    }
-
-    with _CONFIG_MUTATION_LOCK:
-        config = load_config()
-        platforms = config.get("platforms")
-        if not isinstance(platforms, dict):
-            platforms = {}
-            config["platforms"] = platforms
-
-        candidates = set(PLATFORM_TOKEN_ENV_NAMES) | set(env_flag_platforms) | {
-            name for name, block in platforms.items()
-            if isinstance(block, dict) and block.get("enabled") is True
-        }
-        candidates.discard("api_server")
-
-        def _config_name(platform: Any) -> str:
-            # PLATFORM_TOKEN_ENV_NAMES is keyed by the Platform enum; config
-            # blocks (and yaml) use the plain name.
-            return str(getattr(platform, "value", platform))
-
-        touched: list[str] = []
-        for platform in sorted(candidates, key=_config_name):
-            name = _config_name(platform)
-            block = platforms.get(name)
-            if isinstance(block, dict) and "enabled" in block:
-                continue  # the operator decided; not ours to flip
-            token_env = PLATFORM_TOKEN_ENV_NAMES.get(platform)
-            flag_env = env_flag_platforms.get(name)
-            if name not in platforms and not (
-                (token_env and (env.get(token_env) or "").strip())
-                or (flag_env and _env_flag_truthy(env.get(flag_env)))
-            ):
-                continue  # no credential, no flag: the platform is off already
-            platforms[name] = {**(block if isinstance(block, dict) else {}), "enabled": False}
-            touched.append(name)
-
-        if touched:
-            save_config(config)
-            _log.info(
-                "alice pairing: main gateway runs chat-only (disabled platforms: %s)",
-                ", ".join(touched),
-            )
-
-
-def _stop_named_profile_gateway(name: str) -> None:
-    """Stop a named profile's gateway and unload its launchd agent so
-    KeepAlive cannot revive it against the main gateway. The plist file is
-    never deleted — bootstrapping the agent restores the service."""
-    from hermes_cli.profiles import get_profile_dir
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
-
-    token = set_hermes_home_override(get_profile_dir(name))
     try:
-        stop_profile_gateway()
-    finally:
-        reset_hermes_home_override(token)
-    with contextlib.suppress(Exception):
-        subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.gateway-{name}"],
-            capture_output=True,
-            timeout=30,
-        )
-    _log.info(
-        "alice pairing: stopped bot gateway profile=%s (agent unloaded, plist kept)", name
-    )
-
-
-def _start_main_gateway(
-    profile: str, env_overrides: Optional[Dict[str, str]] = None
-) -> None:
-    """Start the installation's main gateway.
-
-    The pid layer treats the default profile's gateway as THE gateway of the
-    installation, so a bot-profile gateway that is currently up must be
-    stopped first — through Hermes' own stop path, inside the bot's home
-    scope, with its launchd agent unloaded rather than deleted. The launchd
-    service is installed and started unless the domain is recorded as unable
-    to supervise gateways on this host (macOS 26 exit 5/125), in which case a
-    forced detached start runs directly instead of racing the supervisor's
-    own fallback spawn. The caller verifies liveness either way;
-    ``env_overrides`` pins the provisioned gateway settings for the child.
-    """
-    for entry in list_profiles() or []:
-        if getattr(entry, "is_default", False):
-            continue
-        if getattr(entry, "gateway_running", False):
-            _stop_named_profile_gateway(entry.name)
-
-    overrides = dict(env_overrides or {})
-    if not _launchd_domain_known_broken():
-        launchd_install(False)
-        try:
-            launchd_start()
-        except SystemExit:
-            # Hermes' launchd-unsupported path may exit the CLI; the forced
-            # detached start below is the supported way forward.
-            pass
-        if _main_gateway_running(profile):
-            return
-    _clear_stale_gateway_runtime_state()
-    if not _spawn_detached_gateway_forced(overrides, profile):
+        launchd_start()
+    except SystemExit as exc:
         raise HTTPException(
             status_code=503,
-            detail="Could not start the main Hermes gateway in the background.",
-        )
+            detail=f"Could not start the main Hermes gateway for profile '{profile}'.",
+        ) from exc
 
 
 def _await_gateway_socket(address: str, port: int, timeout: float = 90.0) -> None:
@@ -830,7 +648,10 @@ async def _build_main_profile_config(
 ) -> Tuple[Dict[str, Any], str]:
     """The provisioning sequence, run inside the main profile's scope."""
     env = await asyncio.to_thread(_read_profile_env, profile)
-    writes = await asyncio.to_thread(_provision_main_gateway_env, env)
+    gateway_running = await asyncio.to_thread(_main_gateway_running, profile)
+    writes = await asyncio.to_thread(
+        _provision_main_gateway_env, env, gateway_running=gateway_running
+    )
     env = {**env, **writes}
 
     key = env.get("API_SERVER_KEY")
@@ -846,33 +667,8 @@ async def _build_main_profile_config(
     if gateway_port is None:
         raise HTTPException(status_code=503, detail="The Hermes gateway port is invalid.")
 
-    if not await asyncio.to_thread(_main_gateway_running, profile):
-        # Applied before the first start so the main gateway boots chat-only.
-        await asyncio.to_thread(_keep_chat_only_platforms, env)
-        # The sticky active profile defines the env scope profile-aware
-        # helpers read (gateway port, platform tokens). While it points at a
-        # bot, every layer of the spawned gateway resolves to that bot — so
-        # the installation's main profile becomes the active one, which is
-        # what "this Hermes' main agent" means operationally.
-        if (get_active_profile() or "") != profile:
-            await asyncio.to_thread(set_active_profile, profile)
-        # Pin the provisioned settings AND the main profile's home for the
-        # child: the spawning dashboard's environ can carry a stale hydrated
-        # API_SERVER_PORT and even an ambient HERMES_HOME pointing at a bot
-        # profile — without this pin the spawn resurrects that bot's gateway.
-        from hermes_constants import get_hermes_home
-
-        overrides = {
-            name: (env.get(name) or "")
-            for name in ("API_SERVER_HOST", "API_SERVER_PORT", "API_SERVER_KEY")
-        }
-        overrides["HERMES_HOME"] = str(get_hermes_home())
-        overrides["API_SERVER_ENABLED"] = "true"
-        await asyncio.to_thread(
-            _start_main_gateway,
-            profile,
-            overrides,
-        )
+    if not gateway_running:
+        await asyncio.to_thread(_start_main_gateway, profile)
 
     configured_address = _pairing_setting(request, "address", None)
     # Prefer the MagicDNS name (stable across addresses) over a raw IP.
@@ -896,17 +692,17 @@ async def _build_main_profile_config(
     if bound_port is None:
         raise HTTPException(status_code=503, detail="The dashboard port is invalid.")
     bound_host = getattr(request.app.state, "bound_host", "127.0.0.1")
+    normalized_dashboard_host = str(bound_host or "").strip().strip("[]").lower()
+    if normalized_dashboard_host in {"127.0.0.1", "localhost", ""}:
+        await asyncio.to_thread(_ensure_tailscale_forward, bound_port)
     if not await asyncio.to_thread(
         _dashboard_reachable_on, address, bound_host, bound_port
     ):
         raise HTTPException(
             status_code=503,
             detail=(
-                "The dashboard is bound to a local-only address and no Tailscale "
-                "Serve forward publishes this port, so this iPhone cannot reach "
-                "the pairing claim endpoint. Run 'tailscale serve --bg --tcp "
-                f"{bound_port} tcp://127.0.0.1:{bound_port}' or bind the "
-                "dashboard to the Tailscale-reachable interface."
+                "The dashboard is not reachable through the tailnet address "
+                "that would be placed in the pairing code."
             ),
         )
     # Alice's dashboard login sends the advertised address as its Host header,
