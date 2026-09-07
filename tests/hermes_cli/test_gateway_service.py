@@ -380,6 +380,35 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    def test_start_reenables_persistently_disabled_job(self, tmp_path, monkeypatch):
+        """An explicit start reverses launchctl's persistent disabled override.
+
+        Otherwise a valid unloaded plist bootstraps with opaque EIO (5) and
+        Hermes incorrectly falls back to an unsupervised detached process.
+        """
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "_launchctl_kickstart_current", lambda label: None)
+        monkeypatch.setattr(gateway_cli, "_launchd_ok", lambda message: None)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start()
+
+        assert calls == [
+            ["launchctl", "enable", "gui/501/ai.hermes.gateway"]
+        ]
+
     def test_wait_for_pid_exit_returns_when_process_gone(self, monkeypatch):
         alive = [True, True, False]
         monkeypatch.setattr(

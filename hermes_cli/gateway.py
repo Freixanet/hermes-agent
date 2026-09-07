@@ -3914,6 +3914,12 @@ def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
+    # `launchctl disable` survives bootout and even a valid plist. An explicit
+    # `hermes gateway start` is authority to reverse that state; otherwise
+    # bootstrap fails with opaque EIO (5) and Hermes incorrectly degrades to a
+    # detached process with no login/crash supervision. `enable` is idempotent.
+    _launchctl_enable_current(label)
+
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         new_plist = generate_launchd_plist()
@@ -3937,6 +3943,25 @@ def launchd_start():
         if not _launchd_bootstrap_and_kickstart(plist_path, label):
             return
     _launchd_ok("✓ Service started")
+
+
+def _launchctl_enable_current(label: str) -> None:
+    """Re-enable this profile's launchd job before an explicit start.
+
+    A disabled override is persistent launchd state, separate from whether the
+    plist exists or is loaded. Leaving it in place makes bootstrap return EIO
+    and sends Hermes down the detached fallback path even though launchd works.
+    """
+    try:
+        subprocess.run(
+            ["launchctl", "enable", f"{_launchd_domain()}/{label}"],
+            check=False,
+            timeout=10,
+            **_CAPTURE_TEXT,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # The normal start/bootstrap path below owns the user-facing failure.
+        pass
 
 
 def _launchctl_kickstart_current(label: str) -> None:
