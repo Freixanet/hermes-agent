@@ -28,6 +28,16 @@ import os
 import re
 import sys
 
+# ``python -m hermes_cli.main`` executes this file as ``__main__``. Several
+# lazily imported command modules import ``hermes_cli.main`` for shared CLI
+# helpers; without this alias Python executes the file a second time under its
+# canonical name. That second startup pass no longer sees a consumed ``-p``
+# flag and can incorrectly follow the sticky active_profile (notably turning a
+# machine/default dashboard back into the selected bot profile). Reuse the
+# already-running module instead.
+if __name__ == "__main__" and getattr(__spec__, "name", None) == "hermes_cli.main":
+    sys.modules.setdefault("hermes_cli.main", sys.modules[__name__])
+
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
