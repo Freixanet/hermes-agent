@@ -187,3 +187,29 @@ def test_unmapped_stops_are_not_expected_rows():
     out.stopped_unmapped_pids.discard(102)
     pre, killed = out.fleet_probe_signals()
     assert _fleet_probe_expected_runtimes(_plan([]), pre, None, out.restarted_services, killed)
+
+
+def test_fleet_settle_allows_slow_macos_gateway_past_thirty_seconds(monkeypatch):
+    """A launchd replacement can exist before its control socket/state is published.
+
+    Keep polling beyond the old 30s cutoff so a healthy cold gateway is not recorded DOWN.
+    """
+    from types import SimpleNamespace
+    from hermes_cli import update_cmd_fleet
+    import hermes_cli.update_receipt as update_receipt
+
+    clock = [0.0]
+    monkeypatch.setattr(update_cmd_fleet._time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(update_cmd_fleet._time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def snapshot(*, pre_restart_pids=None):
+        if clock[0] < 40.0:
+            return [{"profile": "radar-ia", "pid": 10, "state": "down"}]
+        return [{"profile": "radar-ia", "pid": 11, "state": "current"}]
+
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", snapshot)
+    restart = SimpleNamespace(pre_restart_gateway_pids=[10])
+    result = update_cmd_fleet._collect_fleet_snapshot(restart, True)
+
+    assert result[0]["state"] == "current"
+    assert clock[0] >= 40.0

@@ -216,6 +216,23 @@ def test_scan_dashboard_processes_includes_ledger_only_serves(monkeypatch):
     assert (8123, profiled["argv"]) in result
 
 
+def test_scan_dashboard_processes_ignores_legacy_pid_only_ledger_rows(monkeypatch):
+    """A legacy dashboard row without create_time cannot prove PID incarnation.
+
+    If macOS reuses that PID for an unrelated process, ledger augmentation must not
+    resurrect the stale dashboard purely from the old argv.
+    """
+    import hermes_cli.dashboard_procs as dp
+
+    entry = _ledger_entry(pid=82324, purpose="dashboard", create_time=None)
+    fake_pi = SimpleNamespace(ledger_entries=lambda **k: [entry])
+    monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", fake_pi)
+    fake_run = SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr(dp.subprocess, "run", lambda *a, **k: fake_run)
+
+    assert dp._scan_dashboard_processes() == []
+
+
 def test_scan_dashboard_processes_ledger_respects_exclusions(monkeypatch):
     import hermes_cli.dashboard_procs as dp
 

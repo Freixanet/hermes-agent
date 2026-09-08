@@ -100,8 +100,12 @@ def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[t
         seen = {pid for pid, _ in found} | skip
         for entry in ledger_entries():
             pid = entry.get("pid")
+            # Legacy ledger rows may predate create-time capture.  A bare PID cannot prove
+            # incarnation after PID reuse (macOS can recycle it for a protected system
+            # process whose cmdline is unreadable), so never let such a row augment the
+            # process-table scan.  New rows carry create_time and remain authoritative.
             if (entry.get("purpose") in ("serve", "dashboard") and isinstance(pid, int)
-                    and pid not in seen):
+                    and entry.get("create_time") is not None and pid not in seen):
                 found.append((pid, str(entry.get("argv") or "")))
     return found
 

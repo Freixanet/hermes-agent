@@ -1273,7 +1273,9 @@ def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
     from hermes_cli.update_receipt import collect_fleet_versions
     if not rows_expected:
         return collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
-    _fleet_deadline = _time.monotonic() + 30.0
+    # launchd may publish a fresh PID before the gateway control socket/state is ready.
+    # Allow one minute so a healthy but cold profile is not mislabeled DOWN.
+    _fleet_deadline = _time.monotonic() + 60.0
     while True:
         _time.sleep(2.0)
         snapshot = collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
