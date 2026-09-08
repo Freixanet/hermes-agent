@@ -182,6 +182,35 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
 
 
+def test_macos_repairs_get_windows_when_optional_lifecycle_is_dropped(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    (root / "package-lock.json").write_text(
+        '{"packages": {"node_modules/get-windows": {"version": "9.3.0"}}}',
+        encoding="utf-8",
+    )
+    install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
+
+    def repair(cmd, **kwargs):
+        assert "--ignore-scripts" in cmd
+        assert "--no-save" in cmd
+        assert "--package-lock=false" in cmd
+        assert "get-windows@9.3.0" in cmd
+        package_root = root / "node_modules" / "get-windows"
+        package_root.mkdir(parents=True)
+        (package_root / "package.json").write_text('{"version": "9.3.0"}', encoding="utf-8")
+        (package_root / "main").write_text("payload", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch.object(main_desktop.sys, "platform", "darwin"), \
+         patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=install_ok), \
+         patch("hermes_cli.main_desktop.subprocess.run", side_effect=repair) as mock_repair:
+        main_desktop._install_desktop_workspace_deps("/usr/bin/npm", {})
+
+    mock_repair.assert_called_once()
+    assert (root / "node_modules" / "get-windows" / "main").is_file()
+
+
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
     shell out to bare ``node``. When Desktop is launched from the updater chain

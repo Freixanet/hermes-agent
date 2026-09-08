@@ -6,6 +6,7 @@ are imported lazily inside the functions that use them (avoids an import cycle).
 
 import logging
 import contextlib
+import json
 import argparse
 import os
 import re
@@ -1245,6 +1246,52 @@ def _register_linux_desktop_entry() -> None:
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
+def _locked_get_windows_version(project_root: Path) -> Optional[str]:
+    """Return the exact get-windows version pinned by the root lockfile, if any."""
+    try:
+        lock = json.loads((project_root / "package-lock.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    package = (lock.get("packages") or {}).get("node_modules/get-windows") or {}
+    version = package.get("version")
+    return version if isinstance(version, str) and version.strip() else None
+
+
+def _repair_optional_get_windows_on_macos(npm: str, project_root: Path, env: dict) -> bool:
+    """Recover macOS packaging when npm silently drops get-windows as an optional dependency.
+
+    get-windows' install hook tries to download/build a native addon that Hermes does not use on
+    macOS; packaging only needs the package's bundled ``main`` helper. If that optional lifecycle
+    fails (for example through a SOCKS proxy), npm still exits 0 but removes the whole package.
+    Reinstall the exact lockfile version without lifecycle scripts and verify the payload.
+    """
+    if sys.platform != "darwin":
+        return True
+    version = _locked_get_windows_version(project_root)
+    if version is None:
+        return True
+    package_root = project_root / "node_modules" / "get-windows"
+    main = package_root / "main"
+    if main.is_file():
+        return True
+
+    print("  ⚠ npm omitted optional get-windows; restoring the locked macOS payload without lifecycle scripts...")
+    repair_cmd = [
+        npm, "install", "--no-save", "--ignore-scripts", "--package-lock=false",
+        "--no-audit", "--no-fund", f"get-windows@{version}",
+    ]
+    result = subprocess.run(repair_cmd, cwd=project_root, env=_npm_lifecycle_env(env), check=False)
+    try:
+        installed = json.loads((package_root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        installed = {}
+    if result.returncode == 0 and main.is_file() and installed.get("version") == version:
+        print(f"  ✓ Restored get-windows@{version} for macOS packaging.")
+        return True
+    print(f"✗ Could not restore locked get-windows@{version} for macOS packaging.")
+    return False
+
+
 def _install_desktop_workspace_deps(npm: str, env: dict) -> None:
     """npm-install the desktop workspace; exits on a failure that isn't a repairable missing Electron dist."""
     from hermes_cli.main import PROJECT_ROOT
@@ -1258,6 +1305,8 @@ def _install_desktop_workspace_deps(npm: str, env: dict) -> None:
     nixos_env = with_hermes_node_path(_nixos_build_env())
     install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
     if install_result.returncode == 0:
+        if not _repair_optional_get_windows_on_macos(npm, PROJECT_ROOT, nixos_env):
+            sys.exit(1)
         return
     if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
         print(f"✗ Desktop dependency install failed\n  Run manually:  cd {PROJECT_ROOT} && npm ci")
