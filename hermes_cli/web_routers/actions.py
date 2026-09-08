@@ -304,7 +304,7 @@ async def check_hermes_update(force: bool = False):
             with contextlib.suppress(OSError):
                 (get_hermes_home() / ".update_check").unlink()
         diagnostics: Dict[str, str] = {}
-        behind = await asyncio.to_thread(check_for_updates, diagnostics)
+        behind = await asyncio.to_thread(check_for_updates, diagnostics=diagnostics)
     except Exception:
         _log.exception("Update check failed")
         behind = None
