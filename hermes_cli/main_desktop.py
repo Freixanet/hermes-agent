@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time as _time_mod
 
 from pathlib import Path
@@ -1275,21 +1276,48 @@ def _repair_optional_get_windows_on_macos(npm: str, project_root: Path, env: dic
     if main.is_file():
         return True
 
-    print("  ⚠ npm omitted optional get-windows; restoring the locked macOS payload without lifecycle scripts...")
-    repair_cmd = [
-        npm, "install", "--no-save", "--ignore-scripts", "--package-lock=false",
-        "--no-audit", "--no-fund", f"get-windows@{version}",
-    ]
-    result = subprocess.run(repair_cmd, cwd=project_root, env=_npm_lifecycle_env(env), check=False)
+    print("  ⚠ npm omitted optional get-windows; restoring the locked macOS payload from npm cache...")
+    from hermes_constants import with_hermes_node_path
+    repair_env = _npm_lifecycle_env(with_hermes_node_path(env))
     try:
-        installed = json.loads((package_root / "package.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        installed = {}
-    if result.returncode == 0 and main.is_file() and installed.get("version") == version:
-        print(f"  ✓ Restored get-windows@{version} for macOS packaging.")
-        return True
-    print(f"✗ Could not restore locked get-windows@{version} for macOS packaging.")
-    return False
+        with tempfile.TemporaryDirectory(prefix="hermes-get-windows-") as tmp:
+            tmp_path = Path(tmp)
+            repair_cmd = [
+                npm, "pack", "--offline", "--ignore-scripts",
+                "--pack-destination", str(tmp_path), f"get-windows@{version}",
+            ]
+            result = subprocess.run(
+                repair_cmd, cwd=project_root, env=repair_env, check=False,
+                capture_output=True, text=True, timeout=20,
+            )
+            archives = list(tmp_path.glob("get-windows-*.tgz"))
+            if result.returncode != 0 or len(archives) != 1:
+                raise RuntimeError("locked package is not available in the npm cache")
+
+            unpacked = tmp_path / "unpacked"
+            unpacked.mkdir()
+            with tarfile.open(archives[0], "r:gz") as archive:
+                members = archive.getmembers()
+                for member in members:
+                    parts = Path(member.name).parts
+                    if not parts or parts[0] != "package" or ".." in parts or member.issym() or member.islnk():
+                        raise RuntimeError("unsafe npm cache archive")
+                archive.extractall(unpacked, members=members)
+
+            staged = unpacked / "package"
+            staged_main = staged / "main"
+            installed = json.loads((staged / "package.json").read_text(encoding="utf-8"))
+            if installed.get("version") != version or not staged_main.is_file():
+                raise RuntimeError("cached package payload does not match the lockfile")
+            shutil.rmtree(package_root, ignore_errors=True)
+            shutil.copytree(staged, package_root)
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Could not restore cached get-windows@%s: %s", version, exc)
+        print(f"✗ Could not restore locked get-windows@{version} from the npm cache.")
+        return False
+
+    print(f"  ✓ Restored get-windows@{version} from npm cache for macOS packaging.")
+    return True
 
 
 def _install_desktop_workspace_deps(npm: str, env: dict) -> None:

@@ -183,6 +183,9 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
 
 
 def test_macos_repairs_get_windows_when_optional_lifecycle_is_dropped(tmp_path, monkeypatch):
+    import json
+    import tarfile
+
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     (root / "package-lock.json").write_text(
@@ -192,15 +195,20 @@ def test_macos_repairs_get_windows_when_optional_lifecycle_is_dropped(tmp_path, 
     install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
 
     def repair(cmd, **kwargs):
-        assert "--ignore-scripts" in cmd
-        assert "--no-save" in cmd
-        assert "--package-lock=false" in cmd
+        assert cmd[1:4] == ["pack", "--offline", "--ignore-scripts"]
         assert "get-windows@9.3.0" in cmd
-        package_root = root / "node_modules" / "get-windows"
-        package_root.mkdir(parents=True)
-        (package_root / "package.json").write_text('{"version": "9.3.0"}', encoding="utf-8")
-        (package_root / "main").write_text("payload", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0)
+        assert kwargs["timeout"] == 20
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        destination = Path(cmd[cmd.index("--pack-destination") + 1])
+        source = tmp_path / "package"
+        source.mkdir(exist_ok=True)
+        (source / "package.json").write_text('{"version": "9.3.0"}', encoding="utf-8")
+        (source / "main").write_text("payload", encoding="utf-8")
+        archive = destination / "get-windows-9.3.0.tgz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(source, arcname="package")
+        return subprocess.CompletedProcess(cmd, 0, stdout=archive.name, stderr="")
 
     with patch.object(main_desktop.sys, "platform", "darwin"), \
          patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=install_ok), \
@@ -208,8 +216,21 @@ def test_macos_repairs_get_windows_when_optional_lifecycle_is_dropped(tmp_path, 
         main_desktop._install_desktop_workspace_deps("/usr/bin/npm", {})
 
     mock_repair.assert_called_once()
-    assert (root / "node_modules" / "get-windows" / "main").is_file()
+    package_root = root / "node_modules" / "get-windows"
+    assert (package_root / "main").is_file()
+    assert json.loads((package_root / "package.json").read_text())["version"] == "9.3.0"
 
+
+def test_macos_get_windows_cache_repair_times_out_cleanly(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    (root / "package-lock.json").write_text(
+        '{"packages": {"node_modules/get-windows": {"version": "9.3.0"}}}',
+        encoding="utf-8",
+    )
+    with patch.object(main_desktop.sys, "platform", "darwin"), \
+         patch("hermes_cli.main_desktop.subprocess.run", side_effect=subprocess.TimeoutExpired(["npm"], 20)):
+        assert main_desktop._repair_optional_get_windows_on_macos("/usr/bin/npm", root, {}) is False
 
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
