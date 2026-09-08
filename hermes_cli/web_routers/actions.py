@@ -303,14 +303,29 @@ async def check_hermes_update(force: bool = False):
         if force:
             with contextlib.suppress(OSError):
                 (get_hermes_home() / ".update_check").unlink()
-        behind = await asyncio.to_thread(check_for_updates)
+        diagnostics: Dict[str, str] = {}
+        behind = await asyncio.to_thread(check_for_updates, diagnostics)
     except Exception:
         _log.exception("Update check failed")
         behind = None
 
     payload["behind"] = behind
     if behind is None:
-        payload["message"] = "Couldn't reach the update source — try again later."
+        technical = diagnostics.get("detail") if "diagnostics" in locals() else None
+        if technical:
+            payload["check_error"] = dict(diagnostics)
+            if diagnostics.get("kind") == "timeout":
+                payload["message"] = (
+                    "Couldn't check for Hermes updates because the Git update-source probe timed out. "
+                    f"Technical detail: {technical}."
+                )
+            else:
+                payload["message"] = (
+                    "Couldn't check for Hermes updates because Git could not read the update source. "
+                    f"Technical detail: {technical}."
+                )
+        else:
+            payload["message"] = "Couldn't check for Hermes updates; the update source returned no usable state."
     elif behind == 0:
         payload["message"] = "You're on the latest version."
     else:

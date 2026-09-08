@@ -68,12 +68,78 @@ def test_upstream_main_sha_disables_git_prompts(monkeypatch):
     completed = MagicMock(returncode=1, stdout="", stderr="auth required")
     run = MagicMock(return_value=completed)
     monkeypatch.setattr(banner.subprocess, "run", run)
+    monkeypatch.setattr(banner, "_github_main_sha", lambda diagnostics=None: None)
 
     assert banner._upstream_main_sha() is None
     kwargs = run.call_args.kwargs
     assert kwargs["stdin"] is banner.subprocess.DEVNULL
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"
+
+
+def test_git_run_preserves_timeout_diagnostic(monkeypatch):
+    """A passive Git timeout must remain inspectable instead of collapsing to bare None."""
+    from hermes_cli import banner
+
+    def timeout(*_args, **_kwargs):
+        raise banner.subprocess.TimeoutExpired(cmd=["git", "ls-remote"], timeout=3)
+
+    monkeypatch.setattr(banner.subprocess, "run", timeout)
+    diagnostics = {}
+    result = banner._git_run(
+        ["ls-remote", "origin", "main"], network=True, timeout=3,
+        diagnostics=diagnostics, diagnostic_operation="git ls-remote origin/main",
+    )
+    assert result is None
+    assert diagnostics == {
+        "kind": "timeout",
+        "operation": "git ls-remote origin/main",
+        "detail": "git ls-remote origin/main timed out after 3s",
+    }
+
+
+def test_upstream_main_sha_falls_back_to_public_api_after_git_timeout(monkeypatch):
+    """A stuck git-remote-https process must not make the dashboard check inconclusive."""
+    from hermes_cli import banner
+
+    def timeout(*_args, **_kwargs):
+        raise banner.subprocess.TimeoutExpired(cmd=["git", "ls-remote"], timeout=3)
+
+    expected = "b" * 40
+    monkeypatch.setattr(banner.subprocess, "run", timeout)
+    monkeypatch.setattr(banner, "_github_main_sha", lambda diagnostics=None: expected)
+    diagnostics = {}
+
+    assert banner._upstream_main_sha(diagnostics) == expected
+    assert diagnostics == {}
+
+
+def test_official_https_update_check_uses_lightweight_remote_probe(tmp_path, monkeypatch):
+    """Official HTTPS installs must not need a full fetch just to answer update availability."""
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    head = "a" * 40
+    upstream = "b" * 40
+
+    def stdout(args, *, cwd, timeout=5):
+        if args[:3] == ["remote", "get-url", "origin"]:
+            return "https://github.com/NousResearch/hermes-agent.git"
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return head
+        raise AssertionError(f"unexpected local git probe: {args}")
+
+    monkeypatch.setattr(banner, "_git_stdout", stdout)
+    monkeypatch.setattr(banner, "_upstream_main_sha", lambda diagnostics=None: upstream)
+    monkeypatch.setattr(banner, "_tips_behind", lambda h, u, rd=None: 7)
+    monkeypatch.setattr(
+        banner, "_git_ok",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("official probe must not fetch")),
+    )
+
+    assert banner._check_via_local_git(repo_dir) == 7
 
 
 def test_check_via_local_git_fetch_failure_returns_none(tmp_path, monkeypatch):
@@ -93,7 +159,7 @@ def test_check_via_local_git_fetch_failure_returns_none(tmp_path, monkeypatch):
     # Simulate a non-shallow, non-SSH-remote checkout
     def mock_git_stdout(args, *, cwd, timeout=5):
         if args[:2] == ["remote", "get-url"]:
-            return "https://github.com/NousResearch/hermes-agent.git"
+            return "https://example.invalid/NousResearch/hermes-agent.git"
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
         return None
@@ -144,7 +210,7 @@ def test_check_via_local_git_fetch_failure_keeps_positive_stale_count(tmp_path, 
 
     def mock_git_stdout(args, *, cwd, timeout=5):
         if args[:2] == ["remote", "get-url"]:
-            return "https://github.com/NousResearch/hermes-agent.git"
+            return "https://example.invalid/NousResearch/hermes-agent.git"
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
         return None
@@ -182,7 +248,7 @@ def test_check_via_local_git_fetch_failure_rev_list_error_returns_none(tmp_path,
 
     def mock_git_stdout(args, *, cwd, timeout=5):
         if args[:2] == ["remote", "get-url"]:
-            return "https://github.com/NousResearch/hermes-agent.git"
+            return "https://example.invalid/NousResearch/hermes-agent.git"
         if args[:2] == ["rev-parse", "--is-shallow-repository"]:
             return "false"
         return None
@@ -231,7 +297,7 @@ def test_check_for_updates_does_not_cache_none(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     # Mock the internal functions to force the local-git path returning None
-    monkeypatch.setattr(banner, "_check_via_local_git", lambda rd: None)
+    monkeypatch.setattr(banner, "_check_via_local_git", lambda rd, diagnostics=None: None)
     monkeypatch.setattr(
         "hermes_cli.config.detect_install_method", lambda root: "git"
     )

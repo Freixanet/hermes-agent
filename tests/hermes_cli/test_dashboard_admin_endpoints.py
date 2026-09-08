@@ -848,7 +848,7 @@ class TestUpdateCheckEndpoint:
         # Stub the shared checker so the contract is deterministic (no network).
         import hermes_cli.banner as banner
 
-        monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(banner, "check_for_updates", lambda diagnostics=None: 5)
 
         r = self.client.get("/api/hermes/update/check")
         assert r.status_code == 200
@@ -867,6 +867,33 @@ class TestUpdateCheckEndpoint:
         assert body["update_available"] is True
         # git/pip installs can apply the update in place from the dashboard.
         assert body["can_apply"] is True
+
+    def test_git_timeout_reports_sanitized_technical_detail(self, monkeypatch):
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda *a, **k: "git")
+
+        def timeout(diagnostics=None):
+            if diagnostics is not None:
+                diagnostics.update({
+                    "kind": "timeout",
+                    "operation": "git ls-remote origin/main",
+                    "detail": "git ls-remote origin/main timed out after 10s",
+                })
+            return None
+
+        monkeypatch.setattr(banner, "check_for_updates", timeout)
+        body = self.client.get("/api/hermes/update/check?force=true").json()
+
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body["check_error"] == {
+            "kind": "timeout",
+            "operation": "git ls-remote origin/main",
+            "detail": "git ls-remote origin/main timed out after 10s",
+        }
+        assert "Git update-source probe timed out" in body["message"]
+        assert "Technical detail: git ls-remote origin/main timed out after 10s" in body["message"]
 
 
 

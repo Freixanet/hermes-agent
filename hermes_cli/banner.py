@@ -160,7 +160,8 @@ _GIT_TEXT_KW = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
 def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, text: bool = True,
-             network: bool = False):
+             network: bool = False, diagnostics: Optional[Dict[str, str]] = None,
+             diagnostic_operation: Optional[str] = None):
     """Run ``git <args>`` with the shared subprocess boilerplate; None on any exception.
 
     git output is UTF-8; on Windows ``text=True`` defaults to the ANSI code page and a byte like the
@@ -176,7 +177,23 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
         return subprocess.run(
             ["git", *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
             **(_GIT_TEXT_KW if text else {}), **kwargs)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        if network and diagnostics is not None:
+            operation = diagnostic_operation or "Git update-source probe"
+            diagnostics.update({
+                "kind": "timeout",
+                "operation": operation,
+                "detail": f"{operation} timed out after {timeout}s",
+            })
+        return None
+    except Exception as exc:
+        if network and diagnostics is not None:
+            operation = diagnostic_operation or "Git update-source probe"
+            diagnostics.update({
+                "kind": "git_exception",
+                "operation": operation,
+                "detail": f"{operation} failed with {type(exc).__name__}",
+            })
         return None
 
 
@@ -247,32 +264,86 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of upstream main via HTTPS ls-remote (no auth, no prompts)."""
-    result = _git_run(["ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"], timeout=10, network=True)
-    if result is None or result.returncode != 0 or not result.stdout:
+def _github_main_sha(diagnostics: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Tip SHA of official main via GitHub's public JSON API."""
+    import urllib.request
+
+    operation = "GitHub API main-tip probe"
+    req = urllib.request.Request(
+        "https://api.github.com/repos/nousresearch/hermes-agent/commits/main",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "hermes-cli-update-check"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        sha = payload.get("sha") if isinstance(payload, dict) else None
+        return sha if _is_full_sha(sha) else None
+    except Exception as exc:
+        if diagnostics is not None:
+            code = getattr(exc, "code", None)
+            suffix = f" (HTTP {code})" if isinstance(code, int) else f" ({type(exc).__name__})"
+            diagnostics.update({
+                "kind": "api_failure",
+                "operation": operation,
+                "detail": f"{operation} failed{suffix}",
+            })
         return None
-    return result.stdout.split()[0] or None
 
 
-def _check_via_rev(local_rev: str) -> Optional[int]:
+def _upstream_main_sha(diagnostics: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Fresh official main SHA without auth; Git first, public API as a bounded fallback."""
+    operation = "git ls-remote origin/main"
+    git_diagnostics: Dict[str, str] = {}
+    result = _git_run(
+        ["ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+        timeout=3, network=True, diagnostics=git_diagnostics, diagnostic_operation=operation,
+    )
+    if result is not None and result.returncode == 0 and result.stdout:
+        return result.stdout.split()[0] or None
+    if result is not None and (result.returncode != 0 or not result.stdout):
+        git_diagnostics.update({
+            "kind": "git_exit",
+            "operation": operation,
+            "detail": f"{operation} exited {result.returncode}",
+        })
+
+    api_diagnostics: Dict[str, str] = {}
+    api_sha = _github_main_sha(api_diagnostics)
+    if api_sha:
+        return api_sha
+
+    if diagnostics is not None:
+        parts = [d.get("detail") for d in (git_diagnostics, api_diagnostics) if d.get("detail")]
+        diagnostics.update({
+            "kind": "update_source_unreachable",
+            "operation": "official Hermes main-tip probe",
+            "detail": "; ".join(parts) or "official Hermes main-tip probe returned no usable SHA",
+        })
+    return None
+
+
+def _check_via_rev(
+    local_rev: str, diagnostics: Optional[Dict[str, str]] = None
+) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote (see ``_tips_behind``)."""
-    return _tips_behind(local_rev, _upstream_main_sha())
+    return _tips_behind(local_rev, _upstream_main_sha(diagnostics))
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
+def _check_via_local_git(
+    repo_dir: Path, diagnostics: Optional[Dict[str, str]] = None
+) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    if _canonical_github_remote(origin_url) == _OFFICIAL_REPO_CANONICAL:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         if not head_rev:
             return None
-        # Passive probe via HTTPS ls-remote (never SSH — no hardware-key prompts). Tip SHAs alone
-        # can't distinguish "behind" from a local commit AHEAD of origin/main, and misreporting an
-        # ahead checkout nudges the user into `hermes update`, which can wipe carried work — hence
-        # the ancestor check, against the FRESH upstream SHA (a stale tracking ref can't fake an
-        # up-to-date report).
-        return _tips_behind(head_rev, _upstream_main_sha(), repo_dir)
+        # The official remote is public, so a passive HTTPS ls-remote is enough to learn the
+        # fresh main tip. Avoid a full fetch for a banner/dashboard check: on flaky links the
+        # fetch can exceed the passive check's 10s deadline even though GitHub itself is reachable.
+        # Tip SHAs alone cannot distinguish "behind" from a local commit AHEAD of origin/main,
+        # hence the ancestor/compare logic in _tips_behind.
+        return _tips_behind(head_rev, _upstream_main_sha(diagnostics), repo_dir)
 
     # Installer checkouts are shallow (`git clone --depth 1`): a plain `git fetch` would unshallow
     # the repo and `rev-list --count HEAD..origin/main` would report a bogus "12492 commits
@@ -294,7 +365,20 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # A scoped fetch still updates ``origin/main`` and FETCH_HEAD; ``--depth 1`` preserves
         # the shallow boundary.
         fetch_args = ["fetch", "origin", "main", *(["--depth", "1"] if is_shallow else []), "--quiet"]
-        return _git_ok(fetch_args, cwd=repo_dir, timeout=10, network=True)
+        operation = "git fetch origin/main"
+        result = _git_run(
+            fetch_args, cwd=repo_dir, timeout=10, text=False, network=True,
+            diagnostics=diagnostics, diagnostic_operation=operation,
+        )
+        if result is None:
+            return False
+        if result.returncode != 0 and diagnostics is not None:
+            diagnostics.update({
+                "kind": "git_exit",
+                "operation": operation,
+                "detail": f"{operation} exited {result.returncode}",
+            })
+        return result.returncode == 0
 
     fetch_ok = _quiet(_fetch, False)  # Offline or timeout — don't use stale refs
     # When the fetch fails the local origin/main ref is stale: it cannot prove *currentness*, but
@@ -321,12 +405,14 @@ def _read_json(path: Path) -> Optional[dict]:
     return blob if isinstance(blob, dict) else None
 
 
-def check_for_updates() -> Optional[int]:
+def check_for_updates(diagnostics: Optional[Dict[str, str]] = None) -> Optional[int]:
     """Check whether a Hermes update is available.
 
     If ``HERMES_REVISION`` is set (nix builds embed it), compare it to upstream main via
     ``git ls-remote``; otherwise count commits behind ``origin/main`` in the local checkout.
     """
+    if diagnostics is not None:
+        diagnostics.clear()
     cache_file = get_hermes_home() / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
     # Docker images have no working tree (the image excludes `.git`) and set no HERMES_REVISION.
@@ -345,14 +431,16 @@ def check_for_updates() -> Optional[int]:
             and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION):
         return cached.get("behind")
     if embedded_rev:
-        behind = _check_via_rev(embedded_rev)
+        behind = _check_via_rev(embedded_rev, diagnostics)
     else:
         # No checkout and no embedded revision — status can't be determined.
         repo_dir = _resolve_repo_dir()
-        behind = _check_via_local_git(repo_dir) if repo_dir is not None else None
+        behind = _check_via_local_git(repo_dir, diagnostics) if repo_dir is not None else None
     # Don't cache inconclusive results: None means the check could not run (typically a failed
     # fetch), and caching it would suppress retries for the full 6-hour window (#82166).
     if behind is not None:
+        if diagnostics is not None:
+            diagnostics.clear()
         _quiet(lambda: cache_file.write_text(
             json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}), encoding="utf-8"))
     return behind
