@@ -1371,8 +1371,33 @@ class TestWebServerEndpoints:
             "action_id": "a" * 32,
         }
         assert calls == [
-            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
+            (["-p", "default", "update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
         ]
+
+    def test_update_hermes_pins_install_root_when_another_profile_is_sticky(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 12346
+
+        calls = []
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "c" * 32)
+        monkeypatch.setattr(
+            _web_server_gateway,
+            "_spawn_hermes_action",
+            lambda subcommand, name, *, env_overrides=None:
+                calls.append((list(subcommand), name, dict(env_overrides or {}))) or Proc(),
+        )
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert calls[0][0] == ["-p", "default", "update"]
+        assert calls[0][2]["HERMES_ACTION_ID"] == "c" * 32
 
     def test_update_hermes_reuses_running_action(self, monkeypatch):
         import hermes_cli.web_server as web_server

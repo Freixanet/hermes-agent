@@ -226,7 +226,15 @@ async def update_hermes():
 
     action_id = secrets.token_hex(16)
     with http_failure("Failed to spawn hermes update", 500, "Failed to start update"):
-        proc = _spawn_hermes_action(["update"], "hermes-update", env_overrides={"HERMES_ACTION_ID": action_id})
+        # Updating is install-scoped, not profile-scoped.  A bare child would honor the
+        # sticky active_profile and could therefore read another profile's updates policy
+        # (or move the shared checkout differently from the machine-level dashboard).
+        # Pin the default/root profile explicitly so /update has one deterministic contract.
+        proc = _spawn_hermes_action(
+            ["-p", "default", "update"],
+            "hermes-update",
+            env_overrides={"HERMES_ACTION_ID": action_id},
+        )
     return {"ok": True, "pid": proc.pid, "name": "hermes-update", "action_id": action_id}
 
 
