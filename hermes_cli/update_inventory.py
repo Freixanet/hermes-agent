@@ -225,6 +225,7 @@ def _collect_ledger_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
                 detail={
                     "argv": entry.get("argv") or "", "host": entry.get("host") or "",
                     "port": entry.get("port"), "create_time": entry.get("create_time"),
+                    "registered_at": entry.get("registered_at"),
                 },
             ))
 

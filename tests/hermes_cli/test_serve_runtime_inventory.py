@@ -262,3 +262,4 @@ def test_inventory_records_the_serve_process_incarnation(monkeypatch):
     plan = update_inventory.collect_runtime_inventory()
     serves = [r for r in plan.runtimes if r.kind == "serve"]
     assert serves and serves[0].detail["create_time"] == 1712345678.5
+    assert serves[0].detail["registered_at"] == 222.0

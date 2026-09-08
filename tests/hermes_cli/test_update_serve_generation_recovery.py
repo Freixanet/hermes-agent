@@ -46,7 +46,7 @@ def _plan(*runtimes):
     return SimpleNamespace(runtimes=list(runtimes))
 
 
-def _serve_runtime(pid, *, create_time=None, kind="serve", profile="default"):
+def _serve_runtime(pid, *, create_time=None, registered_at=None, kind="serve", profile="default"):
     """A planned serve runtime carrying its process incarnation, the way the
     inventory records it (``detail["create_time"]`` from the spawn ledger)."""
     return SimpleNamespace(
@@ -54,7 +54,7 @@ def _serve_runtime(pid, *, create_time=None, kind="serve", profile="default"):
         profile=profile,
         supervisor="manual-serve",
         pid=pid,
-        detail={"create_time": create_time},
+        detail={"create_time": create_time, "registered_at": registered_at},
     )
 
 
@@ -1230,3 +1230,41 @@ def test_missing_incarnation_on_either_side_fails_closed(monkeypatch):
             "supervisor": "manual-serve",
         }
     ]
+
+
+def test_legacy_pid_reuse_after_ledger_registration_is_not_a_survivor(monkeypatch):
+    """A legacy ``create_time=null`` row cannot resurrect an unrelated recycled PID.
+
+    ``registered_at`` is an upper bound on the old Hermes process start: if the process
+    currently using the PID started later, it is provably a different incarnation.
+    """
+    monkeypatch.setattr(
+        _identity_module(),
+        "ledger_entries",
+        lambda *a, **k: [{
+            "pid": 82324, "purpose": "dashboard",
+            "create_time": None, "registered_at": 1000.0,
+        }],
+    )
+    monkeypatch.setattr(abort_recovery, "_live_process_create_time", lambda pid: 5000.0)
+
+    assert update_cmd._surviving_pre_update_serve_runtimes(
+        _plan(_serve_runtime(82324, create_time=None, registered_at=1000.0, kind="dashboard"))
+    ) == []
+
+
+def test_legacy_runtime_still_fails_closed_when_pid_reuse_cannot_be_proved(monkeypatch):
+    monkeypatch.setattr(
+        _identity_module(),
+        "ledger_entries",
+        lambda *a, **k: [{
+            "pid": 4242, "purpose": "serve",
+            "create_time": None, "registered_at": 1000.0,
+        }],
+    )
+    monkeypatch.setattr(abort_recovery, "_live_process_create_time", lambda pid: 900.0)
+
+    rows = update_cmd._surviving_pre_update_serve_runtimes(
+        _plan(_serve_runtime(4242, create_time=None, registered_at=1000.0))
+    )
+    assert [row["pid"] for row in rows] == [4242]

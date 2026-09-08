@@ -39,7 +39,9 @@ def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
                 "pid": pid, "kind": str(getattr(runtime, "kind", "")),
                 "profile": str(getattr(runtime, "profile", "")),
                 "supervisor": str(getattr(runtime, "supervisor", "")),
-                "_create_time": _numeric(detail.get("create_time") if isinstance(detail, dict) else None)}
+                "_create_time": _numeric(detail.get("create_time") if isinstance(detail, dict) else None),
+                "_registered_at": _numeric(detail.get("registered_at") if isinstance(detail, dict) else None),
+            }
     except Exception as exc:
         logger.debug("Could not read planned serve runtimes: %s", exc)
         return []
@@ -47,8 +49,11 @@ def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
         return []
     try:
         from hermes_cli.process_identity import ledger_entries
-        live: dict[int, float | None] = {
-            entry["pid"]: _numeric(entry.get("create_time"))
+        live: dict[int, dict[str, float | None]] = {
+            entry["pid"]: {
+                "create_time": _numeric(entry.get("create_time")),
+                "registered_at": _numeric(entry.get("registered_at")),
+            }
             for entry in ledger_entries()
             if entry.get("purpose") in ("serve", "dashboard") and isinstance(entry.get("pid"), int)}
     except Exception as exc:
@@ -57,24 +62,56 @@ def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
     def _still_live(pid, row) -> bool:
         if live is None:
             return True
-        if pid not in live:
+        current = live.get(pid)
+        if current is None:
             return False
-        planned_created, live_created = row["_create_time"], live[pid]
-        # Same number, different process: the pre-update runtime is gone and something new
-        # registered under its PID. Not a survivor.
-        return not (
-            planned_created is not None and live_created is not None
-            and abs(float(live_created) - float(planned_created)) >= 2.0)
 
-    # The operator-facing row drops the incarnation (a matching key only).
+        planned_created = row["_create_time"]
+        live_created = current["create_time"]
+        actual_created = live_created if live_created is not None else _live_process_create_time(pid)
+
+        # Strong identity: when both incarnations are known, compare the actual process start
+        # time. A recycled PID cannot survive this check.
+        if planned_created is not None and actual_created is not None:
+            return abs(float(actual_created) - float(planned_created)) < 2.0
+
+        # Legacy ledger rows may predate create-time capture. ``registered_at`` was written by
+        # that Hermes process itself, so a live process that started *after* the old row was
+        # registered is provably a different incarnation. This closes the macOS PID-reuse case
+        # without pretending that a bare legacy PID is positive identity.
+        planned_registered = row["_registered_at"]
+        if (
+            planned_registered is not None and actual_created is not None
+            and float(actual_created) > float(planned_registered) + 2.0
+        ):
+            return False
+
+        # Missing evidence remains fail-closed: only a provable replacement clears the row.
+        return True
+
+    # The operator-facing row drops incarnation-only matching keys.
     survivors = [
-        {k: v for k, v in row.items() if k != "_create_time"}
+        {k: v for k, v in row.items() if k not in ("_create_time", "_registered_at")}
         for pid, row in planned.items() if _still_live(pid, row)]
     return sorted(survivors, key=lambda row: row["pid"])
 
 
 def _numeric(value):
     return value if isinstance(value, (int, float)) else None
+
+
+def _live_process_create_time(pid: int) -> float | None:
+    """Best-effort creation time for the process currently using ``pid``.
+
+    This is deliberately independent from the spawn ledger: legacy rows can have
+    ``create_time=null``, while psutil can still identify the *current* incarnation.
+    """
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
 
 
 def _qualified_serve_skips(skip_units) -> list[dict]:
