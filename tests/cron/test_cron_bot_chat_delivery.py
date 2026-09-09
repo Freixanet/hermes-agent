@@ -6,7 +6,6 @@ preflight exemption, create-time validation, the subprocess delivery lane,
 and the delivery-targets listing used by UI pickers.
 """
 
-import subprocess
 from unittest import mock
 
 import pytest
@@ -114,93 +113,93 @@ def test_create_validation_accepts_bare_and_existing():
 
 # ── delivery lane ────────────────────────────────────────────────────────────
 
-def _completed(returncode=0, stderr=""):
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr=stderr)
-
-
-def test_deliver_runs_canonical_bot_chat_lane():
-    """The subprocess must use the Bot Mode agent-to-agent chat lane:
-    chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>."""
-    calls = {}
-
-    def fake_run(argv, **kwargs):
-        calls["argv"] = argv
-        calls["kwargs"] = kwargs
-        return _completed()
-
-    with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
-        err = _deliver_to_bot_chat({"id": "j1", "name": "Daily digest"}, "the output", "")
-
-    assert err is None
-    argv = calls["argv"]
-    assert argv[0] == "/usr/bin/hermes"
-    assert "-p" not in argv  # own profile: subprocess inherits HERMES_HOME
-    assert "chat" in argv
-    assert "Bot Chat" in argv
-    assert "--create-if-missing" in argv
-    assert "-Q" in argv
-    assert "--query-file" in argv
-    # Message rides a temp file, never inline argv (quote/expansion safety).
-    assert not any("the output" in str(a) for a in argv)
-
-
-def test_deliver_named_profile_uses_p_flag_and_clears_home():
-    calls = {}
-
-    def fake_run(argv, **kwargs):
-        calls["argv"] = argv
-        calls["kwargs"] = kwargs
-        return _completed()
-
-    with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"), \
-         mock.patch.dict(sched.os.environ, {"HERMES_HOME": "/tmp/other-profile"}):
-        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "research")
-
-    assert err is None
-    argv = calls["argv"]
-    assert argv[1:3] == ["-p", "research"]
-    # -p owns resolution; the scheduler's own HERMES_HOME must not leak in.
-    assert "HERMES_HOME" not in calls["kwargs"]["env"]
-
-
-def test_deliver_failure_returns_error_string():
-    with mock.patch.object(
-        sched.subprocess, "run", return_value=_completed(returncode=1, stderr="boom")
-    ), mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
-        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
-    assert err is not None
-    assert "boom" in err
-
-
-def test_deliver_timeout_returns_error_string():
-    with mock.patch.object(
-        sched.subprocess, "run",
-        side_effect=subprocess.TimeoutExpired(cmd="hermes", timeout=600),
-    ), mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
-        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
-    assert err is not None
-    assert "timed out" in err
-
-
-def test_deliver_message_carries_cron_attribution(tmp_path):
-    """The injected turn must self-identify as scheduled output, not the user."""
+def test_deliver_appends_finished_output_as_bot_message(tmp_path, monkeypatch):
     captured = {}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(sched_delivery, "find_canonical_live_owner", lambda home: None, raising=False)
+    monkeypatch.setattr(sched_delivery, "_append_assistant_to_canonical_bot_chat",
+                        lambda home, content, delivery_id, profile_name: captured.update(
+                            home=home, content=content, delivery_id=delivery_id, profile_name=profile_name))
 
-    def fake_run(argv, **kwargs):
-        qf = argv[argv.index("--query-file") + 1]
-        with open(qf, encoding="utf-8") as fh:
-            captured["message"] = fh.read()
-        return _completed()
+    err = _deliver_to_bot_chat(
+        {"id": "j1", "name": "Daily digest", "execution_id": "run-1"},
+        "the output", "",
+    )
 
-    with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
-        _deliver_to_bot_chat({"id": "j1", "name": "Daily digest"}, "the payload", "")
+    assert err is None
+    assert captured["content"] == "the output"
+    assert captured["profile_name"] == "default"
+    assert "Cronjob" not in captured["content"]
+    assert "not the user" not in captured["content"]
 
-    assert 'Cronjob "Daily digest" output' in captured["message"]
-    assert "not the user" in captured["message"]
-    assert "the payload" in captured["message"]
+
+def test_deliver_named_profile_writes_that_profiles_bot_chat(tmp_path, monkeypatch):
+    source = tmp_path / ".hermes"
+    target = tmp_path / ".hermes" / "profiles" / "research"
+    target.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(source))
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda profile: target)
+    captured = {}
+    monkeypatch.setattr(sched_delivery, "_append_assistant_to_canonical_bot_chat",
+                        lambda home, content, delivery_id, profile_name: captured.update(
+                            home=home, content=content, profile_name=profile_name))
+
+    assert _deliver_to_bot_chat(
+        {"id": "j1", "execution_id": "run-1"}, "out", "research"
+    ) is None
+    assert captured["home"] == target.resolve()
+    assert captured["profile_name"] == "research"
+
+
+def test_deliver_live_owner_uses_assistant_message_mailbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    owner = dict(profile_home=str(tmp_path.resolve()), session_id="bot",
+                 lease_id="lease", live_session_id="live")
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: owner)
+    direct = mock.Mock(side_effect=AssertionError("live owner must receive mailbox delivery"))
+    monkeypatch.setattr(sched_delivery, "_append_assistant_to_canonical_bot_chat", direct)
+
+    err = _deliver_to_bot_chat(
+        {"id": "j1", "execution_id": "run-1"}, "finished report", ""
+    )
+    assert err is not None and "queued" in err
+    record = next((tmp_path / "runtime" / "bot_live_delivery").glob("*.json"))
+    payload = __import__("json").loads(record.read_text())
+    assert payload["message"] == "finished report"
+    assert payload["mode"] == "assistant_message"
+    direct.assert_not_called()
+
+
+def test_direct_append_creates_one_assistant_only_canonical_message(tmp_path):
+    from hermes_state import SessionDB
+
+    delivery_id = "a" * 64
+    sched_delivery._append_assistant_to_canonical_bot_chat(
+        tmp_path, "scheduled report", delivery_id, profile_name="research"
+    )
+    # Retry is idempotent: same execution does not duplicate the report.
+    sched_delivery._append_assistant_to_canonical_bot_chat(
+        tmp_path, "scheduled report", delivery_id, profile_name="research"
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db", read_only=True)
+    try:
+        row = db.get_session_by_title("Bot Chat")
+        assert row is not None and row["hidden"]
+        messages = db.get_messages_as_conversation(row["id"])
+    finally:
+        db.close()
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("assistant", "scheduled report")
+    ]
+
+
+def test_deliver_direct_write_failure_returns_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(sched_delivery, "_append_assistant_to_canonical_bot_chat",
+                        mock.Mock(side_effect=RuntimeError("disk unavailable")))
+    err = _deliver_to_bot_chat({"id": "j1", "execution_id": "run"}, "out", "")
+    assert err is not None and "disk unavailable" in err
 
 
 # ── delivery-targets listing (UI pickers) ────────────────────────────────────

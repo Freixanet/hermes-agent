@@ -26,7 +26,8 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
         assert len(records) == 1
         key = records[0].stem
         record = mailbox.read_delivery_result(home, key)
-        assert record and record["message"].endswith("payload")
+        assert record and record["message"] == "payload"
+        assert record["mode"] == "assistant_message"
         discovery.side_effect = AssertionError("receipt must precede discovery")
         assert delivery._deliver_to_bot_chat(dict(job), "payload", profile) == pending
         mailbox.claim_pending_delivery(home, owner)

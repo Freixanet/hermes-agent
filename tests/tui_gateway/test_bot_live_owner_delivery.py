@@ -87,3 +87,44 @@ def test_local_work_blocks_mailbox_claim_without_consuming_envelope(monkeypatch,
     assert submitted == ["imported"] and not pending
     assert receipts[0][0][1] == "receipt"
     assert receipts[0][1]["reply"] == "reply"
+
+
+def test_assistant_message_delivery_skips_agent_turn(monkeypatch, tmp_path):
+    import tools.bot_live_delivery as mailbox
+
+    owner = dict(profile_home=str(tmp_path.resolve()), session_id="chat",
+                 lease_id="lease", live_session_id="live")
+    queued = mailbox.deliver_to_live_owner(
+        tmp_path, owner, "scheduled report", mode="assistant_message"
+    )
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: owner)
+    agent = SimpleNamespace(session_id="chat", _session_db=None)
+    class DB:
+        def __init__(self): self.rows = []
+        def has_platform_message_id(self, session_id, marker): return False
+        def append_message(self, session_id, role, content, **kwargs):
+            self.rows.append((session_id, role, content, kwargs))
+    db = DB()
+    emitted = []
+    submit = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run model"))
+    poll = rebind(session_notifications._poll_bot_live_delivery_once, {
+        "_session_home": lambda session: tmp_path,
+        "_run_prompt_submit": submit,
+        "_notif_release_turn": lambda session: None,
+        "_get_db": lambda: db,
+        "_emit": lambda kind, sid, payload=None: emitted.append((kind, sid, payload)),
+    })
+    session = {
+        "history_lock": threading.RLock(), "history": [], "history_version": 0,
+        "agent": agent, "session_key": "chat", "running": False,
+        "active_session_lease": SimpleNamespace(lease_id="lease", released=False),
+    }
+
+    assert poll("live", session) is True
+    assert db.rows[0][0:3] == ("chat", "assistant", "scheduled report")
+    assert session["history"][-1]["role"] == "assistant"
+    assert session["history"][-1]["content"] == "scheduled report"
+    assert any(kind == "message.complete" for kind, _, _ in emitted)
+    receipt = mailbox.read_delivery_result(tmp_path, queued["id"])
+    assert receipt["status"] == "settled"
+    assert receipt["reply"] == "scheduled report"

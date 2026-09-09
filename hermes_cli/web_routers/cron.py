@@ -172,23 +172,24 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
 def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = _job_profile(job_id, profile)
     job = _found(_call_cron_for_profile(selected, "resolve_job_ref", job_id))
-    # Never expose the job as due before claiming it: the built-in ticker and
-    # external/manual fire paths share one durable claim, so only one executes
-    # this run even racing across processes. Active jobs keep the legacy call
-    # shape; paused jobs need the explicit force flag to resume + claim atomically.
-    force = not job.get("enabled", True) or job.get("state") == "paused"
-    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
+    # First persist an explicit manual occurrence. This is the same durable intent
+    # the CLI's `cron run` uses, so a dashboard process and the gateway ticker never
+    # disagree about whether a future job is due. Then make a best-effort immediate
+    # fire. If the owner ticker wins the CAS race, that is success — it is exactly
+    # who should be running the job — not a user-facing 409.
+    queued = _mutate_cron_for_profile(selected, "trigger_job", job["id"])
+    if not queued:
+        raise _job_not_found()
+    ran = _fire_cron_job_for_profile(selected, job["id"], force=False)
     refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
-    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
-        return refreshed
-    if not ran:
-        raise HTTPException(status_code=409, detail="Job is already running or was claimed by another scheduler")
     if refreshed:
         return refreshed
-    # A one-shot may remove itself after exhausting repeat=1: keep the response
-    # shape without inventing an outcome the store no longer holds; the list
-    # refresh removes the completed row.
-    return {**job, "enabled": False, "state": "completed"}
+    if ran:
+        return {**queued, "enabled": False, "state": "completed"}
+    # A competing scheduler may have claimed and removed an exhausted one-shot.
+    # The manual occurrence was accepted, so do not convert ownership success into
+    # an error on the phone.
+    return queued
 
 
 def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):

@@ -515,6 +515,49 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
 
     delivery_id = str(claimed["id"])
 
+    if claimed.get("mode", "prompt") == "assistant_message":
+        content = str(claimed.get("message") or "")
+        marker = f"bot-live:{delivery_id}"
+        try:
+            with session["history_lock"]:
+                agent = session.get("agent")
+                db = getattr(agent, "_session_db", None) or _get_db()
+                session_key = str(session.get("session_key") or "")
+                if db is None or not session_key:
+                    raise RuntimeError("Bot Chat session store is unavailable")
+                persisted = db.has_platform_message_id(session_key, marker)
+                in_history = any(
+                    isinstance(item, dict) and item.get("platform_message_id") == marker
+                    for item in session.get("history", [])
+                )
+                if not persisted:
+                    db.append_message(
+                        session_key, "assistant", content,
+                        platform_message_id=marker, observed=True,
+                        display_kind="cron_delivery",
+                        display_metadata={"delivery_id": delivery_id},
+                    )
+                if not in_history:
+                    session.setdefault("history", []).append({
+                        "role": "assistant", "content": content,
+                        "platform_message_id": marker,
+                        "display_kind": "cron_delivery",
+                        "display_metadata": {"delivery_id": delivery_id},
+                    })
+                    session["history_version"] = int(session.get("history_version", 0)) + 1
+            if not in_history:
+                _emit("message.start", sid)
+                _emit("message.delta", sid, {"text": content})
+                _emit("message.complete", sid, {
+                    "id": delivery_id, "text": content, "status": "complete",
+                    "unsolicited": True,
+                })
+            complete_delivery(home, delivery_id, status="settled", reply=content)
+        except Exception as exc:
+            complete_delivery(home, delivery_id, status="failed", error=str(exc))
+            raise
+        return True
+
     def terminal_receipt(terminal: dict) -> None:
         status = str(terminal.get("status") or "failed")
         error = str(terminal.get("error") or "")

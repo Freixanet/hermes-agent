@@ -121,7 +121,7 @@ def _write(path: Path, record: dict[str, Any]) -> None:
 
 def deliver_to_live_owner(
     profile_home: Path | str, owner: dict[str, Any], message: str,
-    *, delivery_id: str | None = None,
+    *, delivery_id: str | None = None, mode: str = "prompt",
 ) -> dict[str, Any]:
     """Return durable admission immediately, without waiting for the owner.
 
@@ -131,12 +131,15 @@ def deliver_to_live_owner(
     pinned = _owner(profile_home, owner)
     if not isinstance(message, str):
         raise ValueError("message must be a string")
+    if mode not in {"prompt", "assistant_message"}:
+        raise ValueError("invalid live delivery mode")
     key = _delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex)
     with _locked(profile_home) as root:
         path = root / f"{key}.json"
         existing = _read(path)
         if existing is not None:
-            if existing["owner"] != pinned or existing["message"] != message:
+            if (existing["owner"] != pinned or existing["message"] != message
+                    or existing.get("mode", "prompt") != mode):
                 raise ValueError("delivery id already belongs to a different payload")
             return existing
         # Wall time can roll back. Permanent receipts retain the admission
@@ -145,7 +148,7 @@ def deliver_to_live_owner(
                         for candidate in root.glob("*.json")
                         if (record := _read(candidate)) is not None), default=0) + 1
         record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
-                      message=message, status="queued", created_at=time.time_ns(),
+                      message=message, mode=mode, status="queued", created_at=time.time_ns(),
                       sequence=sequence)
         _write(path, record)
         return record

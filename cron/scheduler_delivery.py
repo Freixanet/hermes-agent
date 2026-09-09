@@ -641,18 +641,64 @@ def _get_bot_chat_delivery_timeout() -> int:
         return 600
 
 
-def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]:
-    """Hand output to the live Bot Chat owner, or use the legacy unowned CLI lane.
+def _append_assistant_to_canonical_bot_chat(home, content: str, delivery_id: str, *, profile_name: str) -> None:
+    """Persist one scheduled result as the bot's own assistant message, idempotently."""
+    import uuid
+    from pathlib import Path
+    from hermes_state import SessionDB
 
-    None means completed; a queued/claimed receipt returns an explicit unverified status
-    string so existing Optional[str] callers cannot misreport admission as delivery.
-    ``profile`` is ``""`` for the job's own profile.
+    home = Path(home).resolve()
+    db = SessionDB(db_path=home / "state.db")
+    created = None
+    try:
+        row = db.get_session_by_title("Bot Chat")
+        if row and row.get("archived"):
+            with contextlib.suppress(Exception):
+                if db.unarchive_recoverable_session(row["id"]):
+                    row = db.get_session(row["id"])
+        if not row:
+            created = f"cron_bot_chat_{uuid.uuid4().hex[:12]}"
+            db.create_session(
+                created, source="cron", model_config={"follow_profile_config": True},
+                profile_name=profile_name,
+            )
+            db.set_session_hidden(created, True)
+            try:
+                db.set_session_title(created, "Bot Chat")
+                row = db.get_session(created)
+            except ValueError:
+                # Another surface created the canonical chat concurrently. Its title wins;
+                # remove our still-empty loser and re-read the canonical row.
+                with contextlib.suppress(Exception):
+                    db.delete_session_if_empty(created)
+                row = db.get_session_by_title("Bot Chat")
+        if not row:
+            raise RuntimeError("Could not resolve the canonical Bot Chat")
+        session_id = db.get_compression_tip(row["id"]) or row["id"]
+        marker = f"cron:{delivery_id}"
+        if not db.has_platform_message_id(session_id, marker):
+            db.append_message(
+                session_id, "assistant", content,
+                platform_message_id=marker, observed=True,
+                display_kind="cron_delivery",
+                display_metadata={"delivery_id": delivery_id},
+            )
+    finally:
+        db.close()
+
+
+def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]:
+    """Append finished cron output to the canonical Bot Chat as the bot itself.
+
+    This is a one-way assistant delivery: no synthetic user turn and no second model call.
+    A live Bot Chat owner receives the durable envelope so its in-memory history stays in
+    sync; otherwise the scheduler writes the canonical transcript directly. The execution
+    id is the idempotency key, so retries never duplicate a report.
     """
     import hashlib
     import json
-    import tempfile
     import uuid
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_default_hermes_root, get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
         deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
@@ -660,17 +706,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
 
     job_id = job.get("id", "?")
     profile_label = profile or "(own)"
-    message = (
-        f'[Cronjob "{job.get("name", job_id)}" output — scheduled job, not the user. '
-        f"Review it, act on anything that needs action, and summarize "
-        f"for the chat.]\n\n{content}"
-    )
     try:
         source_home = get_hermes_home().resolve()
         home = (get_profile_dir(profile) if profile else source_home).resolve()
-        # run_one_job/claim_fire attach the durable execution id before delivery. The
-        # transient fallback supports direct helper callers, never deduping recurring
-        # runs by their (potentially identical) output or previous last_run timestamp.
         run_id = job.get("execution_id")
         if not run_id:
             run_id = job.setdefault("_bot_chat_run_id", uuid.uuid4().hex)
@@ -678,93 +716,41 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
             [str(source_home), job_id, str(run_id), str(home)],
             ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
-        # Read BEFORE discovery: the previous owner may have exited after accepting.
-        # No receipt state, including ambiguous/failed, authorizes a CLI replay.
+
         receipt = read_delivery_result(home, key)
         if receipt is None:
             owner = find_canonical_live_owner(home)
             if owner is not None:
-                receipt = deliver_to_live_owner(home, owner, message, delivery_id=key)
+                receipt = deliver_to_live_owner(
+                    home, owner, content, delivery_id=key, mode="assistant_message"
+                )
         if receipt is not None:
-            if receipt["message"] != message:
+            if receipt["message"] != content or receipt.get("mode", "prompt") != "assistant_message":
                 raise ValueError("delivery id already belongs to a different payload")
             status = receipt["status"]
             target = f"bot-chat:{profile_label}"
-            receipts = job.setdefault("_bot_chat_delivery_receipts", {})
-            receipts[target] = {"status": status, "delivery_id": key}
+            job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+                "status": status, "delivery_id": key,
+            }
             logger.info("Job '%s': Bot Chat %s receipt=%s status=%s",
                         job_id, profile_label, key, status)
             if status == "settled":
                 return None
-            detail = ("completion unverified; do not resend" if status in ("queued", "claimed")
-                      else receipt.get("error") or receipt.get("reason") or "not completed")
-            return f"{target} {status} (receipt {key}): {detail}"
-    except Exception as exc:
-        # Discovery/admission uncertainty must never open a second-writer fallback.
-        return f"bot-chat delivery to profile '{profile_label}' unverified: {exc}"
+            if status in ("queued", "claimed"):
+                return f"{target} {status} (receipt {key}): completion unverified; do not resend"
+            return f"{target} {status} (receipt {key}): {receipt.get('error') or receipt.get('reason') or 'not completed'}"
 
-    hermes_bin = shutil.which("hermes")
-    if hermes_bin:
-        argv = [hermes_bin]
-    else:
-        try:
-            import importlib.util as _ilu
-            found = _ilu.find_spec("hermes_cli") is not None
-        except Exception:
-            found = False
-        if not found:
-            return "bot-chat delivery failed: hermes CLI not resolvable"
-        argv = [sys.executable, "-m", "hermes_cli.main"]
-
-    def _fail(msg: str, **log_kwargs) -> str:
-        logger.warning("Job '%s': %s", job_id, msg, **log_kwargs)
-        return msg
-
-    from agent.delegation_context import delegated_child_subprocess_env
-    env = delegated_child_subprocess_env(os.environ)
-    if profile:
-        argv += ["-p", profile]
-        # -p owns profile resolution; this scheduler's HERMES_HOME must not shadow it.
-        env.pop("HERMES_HOME", None)
-    else:
-        # Multiplex workers carry the profile in a ContextVar, not os.environ.
-        env["HERMES_HOME"] = str(source_home)
-
-    query_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", suffix=".txt", prefix="hermes-cron-botchat-", delete=False,
-        ) as fh:
-            fh.write(message)
-            query_file = fh.name
-
-        argv += [
-            "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing",
-            "-Q", "--query-file", query_file,
-        ]
-        result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_get_bot_chat_delivery_timeout(), env=env,
-            creationflags=windows_hide_flags())
-        if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "").strip()[-500:]
-            return _fail(
-                f"bot-chat delivery to profile '{profile_label}' failed (exit {result.returncode})"
-                + (f": {tail}" if tail else ""))
-        logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
+        default_home = get_default_hermes_root().resolve()
+        resolved_profile = profile or ("default" if home == default_home else home.name)
+        _append_assistant_to_canonical_bot_chat(
+            home, content, key, profile_name=resolved_profile
+        )
+        logger.info("Job '%s': appended scheduled output to Bot Chat of profile '%s'",
+                    job_id, profile_label)
         return None
-    except subprocess.TimeoutExpired:
-        return _fail(
-            f"bot-chat delivery to profile '{profile_label}' timed out "
-            f"after {_get_bot_chat_delivery_timeout()}s (the bot's turn may "
-            "still complete; raise cron.bot_chat_delivery_timeout_seconds if "
-            "this recurs)")
-    except Exception as e:
-        return _fail(f"bot-chat delivery failed: {str(e) or type(e).__name__}", exc_info=True)
-    finally:
-        if query_file:
-            with contextlib.suppress(OSError):
-                os.unlink(query_file)
-
+    except Exception as exc:
+        logger.warning("Job '%s': bot-chat delivery failed: %s", job_id, exc, exc_info=True)
+        return f"bot-chat delivery to profile '{profile_label}' failed: {str(exc) or type(exc).__name__}"
 
 def _normalize_deliver_value(deliver) -> str:
     """Normalize ``deliver`` to its canonical comma-separated string; ``"local"`` when falsy.
@@ -779,10 +765,10 @@ def _normalize_deliver_value(deliver) -> str:
 
 
 # Routing tokens resolve at fire time (a job outlives platform wiring). ``all`` = platforms with a
-# configured home chat_id (_expand_routing_tokens); ``bot-chat`` is NOT in ``all`` (costs a turn).
+# configured home chat_id (_expand_routing_tokens); ``bot-chat`` is NOT in ``all`` (it is a local transcript delivery).
 _ROUTING_TOKENS = frozenset({"all"})
 
-# Pseudo-platform: deliver output as a real inbound turn into a profile's "Bot Chat" (not a mirror).
+# Pseudo-platform: append output as the profile bot's assistant message in its canonical "Bot Chat".
 # ``bot-chat`` = own profile; ``bot-chat:<name>`` = named profile on THIS machine.
 BOT_CHAT_PLATFORM = "bot-chat"
 

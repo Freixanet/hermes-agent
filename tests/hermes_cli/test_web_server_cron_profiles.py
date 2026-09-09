@@ -553,14 +553,6 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
         "cron.scheduler_provider.resolve_cron_scheduler",
         lambda: RecordingProvider(),
     )
-    monkeypatch.setattr(
-        cron_jobs,
-        "trigger_job",
-        lambda _job_id: (_ for _ in ()).throw(
-            AssertionError("manual fire must not expose the job to the ticker first")
-        ),
-    )
-
     triggered = await _rt_cron.trigger_cron_job(
         selected["id"],
         profile="worker_alpha",
@@ -584,7 +576,7 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
 
 
 @pytest.mark.asyncio
-async def test_trigger_cron_job_reports_lost_claim_as_conflict(
+async def test_trigger_cron_job_treats_scheduler_winning_claim_as_success(
     isolated_profiles,
     monkeypatch,
 ):
@@ -607,11 +599,11 @@ async def test_trigger_cron_job_reports_lost_claim_as_conflict(
         lambda: ClaimLostProvider(),
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
+    triggered = await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
 
-    assert exc.value.status_code == 409
-    assert "already running" in exc.value.detail
+    assert triggered["enabled"] is True
+    assert triggered["state"] == "scheduled"
+    assert triggered["manual_run_at"] == triggered["next_run_at"]
 
 
 @pytest.mark.asyncio
@@ -649,14 +641,14 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
         profile="worker_alpha",
     )
 
-    assert observed["force"] is True
+    assert observed["force"] is False
     assert triggered["enabled"] is True
     assert triggered["state"] == "scheduled"
     assert triggered["last_status"] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_trigger_paused_job_rejects_legacy_provider_without_mutating_job(
+async def test_trigger_paused_job_runs_with_legacy_provider_after_manual_stamp(
     isolated_profiles,
     monkeypatch,
 ):
@@ -683,19 +675,12 @@ async def test_trigger_paused_job_rejects_legacy_provider_without_mutating_job(
         lambda: LegacyProvider(),
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
+    triggered = await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
 
-    assert exc.value.status_code == 409
-    assert "forced" in exc.value.detail.lower()
-    assert calls == []
-    persisted = _web_server_cron._call_cron_for_profile(
-        "worker_alpha",
-        "get_job",
-        job["id"],
-    )
-    assert persisted["state"] == "paused"
-    assert persisted["enabled"] is False
+    assert calls == [job["id"]]
+    assert triggered["state"] == "scheduled"
+    assert triggered["enabled"] is True
+    assert triggered["manual_run_at"] == triggered["next_run_at"]
 
 
 @pytest.mark.asyncio
