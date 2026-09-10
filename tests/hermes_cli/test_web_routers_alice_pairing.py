@@ -540,6 +540,37 @@ class TestGatewayProvisioning:
         monkeypatch.setattr(alice_pairing, "_port_bindable", lambda address, port: True)
         assert alice_pairing._provision_main_gateway_env(env) == {}
 
+    def test_transient_false_liveness_preserves_authenticated_live_gateway(
+        self, pairing_client, main_installation, automation, monkeypatch
+    ):
+        """A stale/briefly unreadable runtime state must never make pairing
+        rewrite the port underneath an already-running authenticated gateway."""
+        before = (main_installation / ".env").read_text(encoding="utf-8")
+        monkeypatch.setattr(
+            alice_pairing,
+            "list_profiles",
+            lambda: _fake_profiles(main_installation, main_running=False),
+        )
+        monkeypatch.setattr(alice_pairing, "_port_bindable", lambda address, port: False)
+        monkeypatch.setattr(
+            alice_pairing,
+            "_allocate_gateway_port",
+            lambda: pytest.fail("live authenticated gateway port must not be reallocated"),
+        )
+        probes = []
+        monkeypatch.setattr(
+            alice_pairing,
+            "_probe_gateway",
+            lambda address, port, key: probes.append((address, port, key)),
+        )
+
+        body = _mint(pairing_client)
+
+        assert body["profile"] == "default"
+        assert (main_installation / ".env").read_text(encoding="utf-8") == before
+        assert automation["start"] == 0
+        assert ("127.0.0.1", 8643, MAIN_KEY) in probes
+
     def test_live_main_gateway_settings_are_never_reconciled_under_it(self, monkeypatch):
         env = {
             "API_SERVER_HOST": "127.0.0.1",

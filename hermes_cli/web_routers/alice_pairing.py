@@ -272,6 +272,30 @@ def _port_bindable(address: str, port: int) -> bool:
         return False
 
 
+def _configured_gateway_is_live(env: Dict[str, str]) -> bool:
+    """Recover from stale liveness metadata without rewriting a live gateway.
+
+    A port that cannot be bound is not necessarily stale: it may be the main
+    gateway itself. Pairing used to interpret that condition as "pick a new
+    port" whenever profile liveness briefly read false, desynchronising .env
+    from the already-running process. Verify the occupied local port with the
+    configured API key before deciding it needs reconciliation.
+    """
+    key = (env.get("API_SERVER_KEY") or "").strip()
+    port = _valid_port(env.get("API_SERVER_PORT"))
+    host = (env.get("API_SERVER_HOST") or "").strip().strip("[]").lower()
+    if not key or port is None or host not in {"127.0.0.1", "localhost", "0.0.0.0", "::"}:
+        return False
+    probe_host = "127.0.0.1"
+    if _port_bindable(probe_host, port):
+        return False
+    try:
+        _probe_gateway(probe_host, port, key)
+    except HTTPException:
+        return False
+    return True
+
+
 def _provision_main_gateway_env(
     env: Dict[str, str], *, gateway_running: bool = False
 ) -> Dict[str, str]:
@@ -649,6 +673,12 @@ async def _build_main_profile_config(
     """The provisioning sequence, run inside the main profile's scope."""
     env = await asyncio.to_thread(_read_profile_env, profile)
     gateway_running = await asyncio.to_thread(_main_gateway_running, profile)
+    if not gateway_running and await asyncio.to_thread(_configured_gateway_is_live, env):
+        gateway_running = True
+        _log.warning(
+            "alice pairing: liveness metadata reported the main gateway stopped, "
+            "but its configured authenticated API is live; preserving its port"
+        )
     writes = await asyncio.to_thread(
         _provision_main_gateway_env, env, gateway_running=gateway_running
     )
